@@ -1,0 +1,29 @@
+name: upstream-sync
+
+# Keep the fork's master at upstream freeunitorg/freeunit. A daily fast-forward
+# only: if the fork has diverged, the run fails loudly instead of merging over
+# someone's work, and a human resolves it.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast-forward master to upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          code=$(gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=master 2>&1) && {
+            echo "$code"
+            exit 0
+          }
+          echo "::warning::upstream-sync did not fast-forward: $code"
+          exit 0
