@@ -7,6 +7,8 @@
 
 **Free as in freedom.**
 
+> **Note:** this repository (`freeunitorg/freeunit-exp`) is the experimental workspace of the FreeUnit Hermes bot — a fork of `freeunitorg/freeunit` used to stage bot work as pull requests. It is not the release repository.
+
 Unit application server, continued by the community.
 
 > The original Unit repository was archived in October 2025.
