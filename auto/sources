@@ -321,6 +321,11 @@ if [ "$NXT_HAVE_LINUX_SENDFILE" = "YES" \
 fi
 
 
+if [ "$NXT_HAVE_KTLS" = "YES" ]; then
+    NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_ktls.c"
+fi
+
+
 if [ "$NXT_HAVE_FREEBSD_SENDFILE" = "YES" \
      -o "$NXT_TEST_BUILD_FREEBSD_SENDFILE" = "YES" ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_FREEBSD_SENDFILE_SRCS"
