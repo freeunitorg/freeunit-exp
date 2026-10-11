@@ -18,9 +18,8 @@ in the knowledge base.
 | Community and communication | https://github.com/freeunitorg/freeunit-exp/discussions/19 |
 | Index: how the work is organised | https://github.com/freeunitorg/freeunit-exp/discussions/20 |
 
-Stream discussions live in the `Ideas` category. Experiment write-ups go to
-`Show and tell`. The maintainer adds `Roadmap` and `Experiments` categories in the
-repository settings when needed; posts then move with one call.
+Stream discussions live in the `Roadmap` category. Experiment write-ups go to
+`Experiments`. The index discussion stays in `General`.
 
 ## Rules that hold in every stream
 
