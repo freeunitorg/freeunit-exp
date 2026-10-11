@@ -1,0 +1,35 @@
+name: exp-tls-module
+
+# Prototype gate: build the TLS backend module, run its smoke test.
+# The prototype sits outside the server build, so this workflow is path-filtered
+# to it and does not touch the server's own jobs.
+
+on:
+  push:
+    paths:
+      - 'exp/tls-module/**'
+      - '.github/workflows/exp-tls-module.yml'
+  pull_request:
+    paths:
+      - 'exp/tls-module/**'
+      - '.github/workflows/exp-tls-module.yml'
+
+jobs:
+  module:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev pkg-config
+
+      - name: versions
+        run: |
+          cc --version | head -1
+          pkg-config --modversion openssl
+
+      - name: build and run the smoke test
+        working-directory: exp/tls-module
+        run: make test
