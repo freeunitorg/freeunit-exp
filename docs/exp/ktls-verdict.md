@@ -31,29 +31,56 @@ available on this kernel" and is a **result**, not a job failure; any other non-
 
 ## Result
 
-### Coordinator box — cannot answer (measured 2026-10-11)
+### Resolved: the first run measured a probe bug, not the kernel (2026-10-11)
 
-`setsockopt(SOL_TLS, TLS_TX, …)` on a connected loopback TCP socket fails with errno 92 ENOPROTOOPT
-(kernel `6.8.0-136-generic`, Alpine 3.25 container, `CapEff 0`, one seccomp filter). Two precision
-points, because the first reading was wrong:
+The first CI run reported `TLS_TX accepted: false, errno 92 ENOPROTOOPT` — and so did the coordinator,
+on three different kernels, with the `tls` module loaded on all of them. That was read as "no TLS
+protocol handler"; it was this probe skipping a documented step.
 
-- the `tls` module **is loaded** (`/sys/module/tls` exists, `^tls ` in `/proc/modules`);
-- errno 92 is the socket layer's **generic** answer — an unknown level (`31337`) returns the same —
-  while `TCP_ULP="tls"` reaches the real kernel path (`ENOTCONN` on an unconnected socket).
+`Documentation/networking/tls.rst`: "First create a new TCP socket and once the connection is
+established set the TLS ULP" — `setsockopt(SOL_TCP, TCP_ULP, "tls")` — "Setting the TLS ULP allows us
+to set/get TLS socket options". Kernel-side (`net/tls/tls_main.c`) `tls_init(sk)` is that ULP's
+`.init`: it returns `-ENOTCONN` unless `sk_state == TCP_ESTABLISHED`, creates the `tls_context` and
+calls `update_sk_prot()`. Only then does `setsockopt(SOL_TLS, …)` reach `do_tls_setsockopt`; without
+it the socket layer answers the generic ENOPROTOOPT — exactly the errno an unknown level `31337` also
+gets, which is what made the negative look like a kernel property.
 
-So "no TLS protocol handler" is **not** established: missing kTLS hook versus a container filter for
-level 282 are both open hypotheses, and neither is decidable from inside. The transferable fact is
-narrow and enough for planning: **this container cannot exercise kTLS**, so CI is the measurement
-environment. Details and the reproduction snippet live in the KB page on the environment.
+**The ULP is mandatory, and the coordinator is not special:** the same connected socket accepts
+`TCP_ULP=tls` and then `TLS_TX` locally, and the peer sees `170303002d` with the plaintext hidden. The
+earlier "cause not decidable from inside" wording is retracted in the KB.
 
-### CI — to be filled in from the workflow run
+A second, arithmetic bug surfaced only because the numbers were inspected: every timing column read
+`5 × 10.006 s` with ~0.001 s of process CPU. `sendfile()` returns short once the socket buffer is
+full, and the drain loop waited for the *requested* payload, sitting in the recv timeout while every
+byte the kernel had accepted had already arrived — and the short-read counter compares against what
+was actually sent, so it stayed clean.
 
-| kernel | `tls` loaded after modprobe | `TLS_TX` accepted | record transform | `sendfile()` ok | plain user/sys CPU | kTLS user/sys CPU |
+### Measured — run 38170196534, both legs green, run 38170020740 for the mechanics
+
+| Runner | kernel | `tls` module | `TLS_TX` | route | record transform | `sendfile()` |
 |---|---|---|---|---|---|---|
-| 6.8 (ubuntu-24.04) | — | — | — | — | — | — |
-| 5.15 (ubuntu-22.04) | — | — | — | — | — | — |
+| ubuntu-24.04 | 6.17.0-1022-azure | loaded | accepted | **ulp** | `1703030033`, plaintext hidden | drives it |
+| ubuntu-22.04 | 6.8.0-1064-azure | loaded | accepted | **ulp** | `1703030033`, plaintext hidden | drives it |
 
-Run URL: _added by the bot when the workflow reports._
+Cost, 5 reps × 4 MiB requested per rep (`sendfile()` handed over ~2.5 MiB per call, the same in both
+arms):
+
+| Arm | plaintext moved | sys CPU | wall | per MiB | throughput |
+|---|---|---|---|---|---|
+| plain socket (24.04) | 12.57 MiB | 0.0045 s | 0.005 s | 0.36 ms | ~2 770 MiB/s |
+| kTLS (24.04) | 12.42 MiB | 0.0101 s | 0.010 s | 0.81 ms | ~1 230 MiB/s |
+| plain socket (22.04) | 12.46 MiB | 0.0046 s | 0.005 s | 0.37 ms | ~2 710 MiB/s |
+| kTLS (22.04) | 12.42 MiB | 0.0115 s | 0.012 s | 0.92 ms | ~1 020 MiB/s |
+
+**Read this correctly: kTLS is ~2.4× slower than plain here, and that is expected — not a
+refutation.** The plain arm performs no cryptography; the kTLS arm pays AES-GCM in the kernel. What
+decides anything for FreeUnit is kTLS against **userspace OpenSSL**, which is what would be replaced
+(userspace read + encrypt + copy per 4 KiB record + write). This run therefore establishes the
+**mechanism** and a **cost baseline** (~0.8–0.9 ms of system CPU per MiB of encrypted plaintext,
+~1.0–1.2 GiB/s through `sendfile()` on a shared runner), not the win.
+
+Step 1b, before any FreeUnit code moves: add the OpenSSL arm to the same harness (same loopback pair,
+same payload, `SSL_write` in 4 KiB records) so a three-way comparison exists.
 
 ## Decision gate
 
