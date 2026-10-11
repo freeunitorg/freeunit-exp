@@ -1,29 +1,156 @@
 name: upstream-sync
 
-# Keep the fork's master at upstream freeunitorg/freeunit. A daily fast-forward
-# only: if the fork has diverged, the run fails loudly instead of merging over
-# someone's work, and a human resolves it.
+# Keep the fork's master an exact mirror of upstream freeunitorg/freeunit master.
+# This job is the only writer of master. It fast-forwards or it fails: it never
+# merges, never forces, and never exits 0 after a failure. The fast-forward is
+# done by the GitHub server (merge-upstream); the job pushes no objects. On failure it opens
+# or updates one issue labelled sync-broken. When a later run passes, it closes
+# that issue.
+#
+# This file must live on the default branch (main): scheduled workflows run
+# only from there.
+#
+# One-time setup by the maintainer (see HERMES.md):
+#   - a GitHub App installed on this repository only, with contents: write and
+#     workflows: write;
+#   - the secrets SYNC_APP_CLIENT_ID and SYNC_APP_PRIVATE_KEY;
+#   - the App as a bypass actor (mode: always) of the protect-master ruleset,
+#     because master has a pull_request rule and merge-upstream writes it as the App.
 
 on:
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
 
+# The job pushes with the App token, not with GITHUB_TOKEN. GITHUB_TOKEN only
+# reads the repository and manages the sync-broken issue.
 permissions:
-  contents: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/freeunitorg/freeunit.git
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      - name: Check the App credentials
+        env:
+          CLIENT_ID: ${{ secrets.SYNC_APP_CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+        run: |
+          set -eu
+          if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ]; then
+            echo "::error::The secrets SYNC_APP_CLIENT_ID and SYNC_APP_PRIVATE_KEY are not both set."
+            exit 1
+          fi
+
+      - name: Create the App token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ secrets.SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+
       - name: Fast-forward master to upstream
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -eu
+          fork_url="https://github.com/${GH_REPO}.git"
+          auth="Authorization: basic $(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)"
+          up=$(git ls-remote "$UPSTREAM_URL" refs/heads/master | cut -f1)
+          fork=$(git -c "http.extraheader=$auth" ls-remote "$fork_url" refs/heads/master | cut -f1)
+          if [ -z "$up" ] || [ -z "$fork" ]; then
+            echo "::error::Cannot read master: upstream='$up' fork='$fork'."
+            exit 1
+          fi
+          echo "fork master:     $fork"
+          echo "upstream master: $up"
+
+          # merge-upstream also merges when it cannot fast-forward. A merge
+          # commit on the mirror is wrong, so check the relation first.
+          # base is fork master, head is upstream master: "ahead" means that
+          # upstream has commits the fork lacks and the fork has none extra.
+          status=$(gh api "repos/${GH_REPO}/compare/master...freeunitorg:master" --jq .status)
+          echo "compare status: $status"
+          case "$status" in
+            identical)
+              echo "master already matches upstream."
+              ;;
+            ahead)
+              # The server fast-forwards or refuses. No clone and no push here.
+              if ! out=$(gh api -X POST "repos/${GH_REPO}/merge-upstream" -f branch=master 2>&1); then
+                echo "::error::merge-upstream failed (a 409 is a conflict, a 422 is another refusal): $out"
+                exit 1
+              fi
+              echo "$out"
+              merge_type=$(printf '%s' "$out" | jq -r '.merge_type // empty')
+              case "$merge_type" in
+                fast-forward|none) ;;
+                *)
+                  echo "::error::merge-upstream answered merge_type '$merge_type', not fast-forward. Fork master may now hold a merge commit. A human must repair it."
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "::error::Fork master and upstream master are '$status', not 'ahead' or 'identical'. Fork master has diverged. A human must repair it."
+              exit 1
+              ;;
+          esac
+
+          # Prove the result from the remote, not from the API answer.
+          after=$(git -c "http.extraheader=$auth" ls-remote "$fork_url" refs/heads/master | cut -f1)
+          up_after=$(git ls-remote "$UPSTREAM_URL" refs/heads/master | cut -f1)
+          if [ "$after" = "$up_after" ]; then
+            :
+          elif [ "$after" = "$up" ]; then
+            echo "::warning::Upstream moved during the run ($up to $up_after). Fork master equals the tip this run synced to. The next run catches up."
+          else
+            echo "::error::After the sync, fork master is $after but upstream master is $up_after."
+            exit 1
+          fi
+          echo "fork master is $after."
+
+      - name: Close the sync-broken issue
+        if: success()
+        run: |
+          set -eu
+          for n in $(gh issue list --label sync-broken --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "The upstream sync passed again: ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Open or update the sync-broken issue
+        if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          code=$(gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=master 2>&1) && {
-            echo "$code"
-            exit 0
-          }
-          echo "::warning::upstream-sync did not fast-forward: $code"
-          exit 0
+          run_url="${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}"
+          gh label create sync-broken --color B60205 \
+            --description "The daily upstream sync of master failed" 2>/dev/null || true
+          existing=$(gh issue list --label sync-broken --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "The upstream sync failed again: ${run_url}"
+          else
+            gh issue create --label sync-broken \
+              --title "Upstream sync is broken" \
+              --body "The daily upstream sync of master failed: ${run_url}
+
+          Fork master is meant to be an exact mirror of ${UPSTREAM_URL%.git}. Read the log of the run. The usual causes are: the App secrets are missing or expired, the App is not a bypass actor of the protect-master ruleset, the App lacks the workflows permission, or fork master has a commit that upstream does not have.
+
+          This issue closes itself when a later run passes."
+          fi
