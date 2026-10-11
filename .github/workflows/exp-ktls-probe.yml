@@ -92,3 +92,38 @@ jobs:
                   print(f"- userspace TLS arm skipped: {r['openssl_skip']}")
           print(f"- verdict: **{r['verdict']}**")
           PY
+
+      - name: key path probe — hand a real TLS 1.3 session to the kernel
+        run: |
+          set +e
+          python3 exp/ktls-probe/ktls_keys_probe.py --max-seq 3 --burst-bytes 262144 \
+              --json > /tmp/ktlskeys.json
+          rc=$?
+          echo "key-path probe exit code: $rc"
+          cat /tmp/ktlskeys.json
+          # rc=2 means "kTLS unavailable on this kernel": a result, not a job failure.
+          # rc=0 is the point of the step. Anything else (1, 3) means the key path itself
+          # did not hold and must fail loudly.
+          if [ "$rc" != "0" ] && [ "$rc" != "2" ]; then exit "$rc"; fi
+
+      - name: key path summary
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          print(f"### kTLS key path — `{os.environ.get('RUNNER_OS')}`")
+          try:
+              r = json.load(open("/tmp/ktlskeys.json"))
+          except Exception as e:
+              print(f"no key-path JSON: {e}")
+              raise SystemExit(0)
+          print(f"- kernel `{r['kernel']}`, `{r['openssl']}`")
+          for a in r.get("attempts", []):
+              print(f"- record sequence {a['seq']}: ok={a['ok']} — {a['detail']}")
+          b = r.get("burst")
+          if b:
+              print(f"- burst: {b.get('bytes')} B in {b.get('chunk')} B writes → "
+                    f"{b.get('received')} B back, ok={b.get('ok')}, "
+                    f"{b.get('mib_per_s')} MiB/s")
+          print(f"- verdict: **{r['verdict']}**")
+          PY
