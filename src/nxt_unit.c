@@ -1162,7 +1162,7 @@ nxt_unit_ready(nxt_unit_ctx_t *ctx, int ready_fd, uint32_t stream, int queue_fd)
 
     nxt_socket_msg_oob_init(&oob, fds);
 
-    res = nxt_unit_sendmsg(ctx, NULL, ready_fd, &msg, sizeof(msg), &oob);
+    res = nxt_unit_sendmsg(ctx, NULL, ready_fd, &msg, sizeof(msg), &oob, 0);
     if (res != sizeof(msg)) {
         return NXT_UNIT_ERROR;
     }
