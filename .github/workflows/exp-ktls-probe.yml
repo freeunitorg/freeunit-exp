@@ -1,0 +1,79 @@
+name: exp-ktls-probe
+
+# The measurement environment for the kTLS track. GitHub-hosted Ubuntu images ship
+# CONFIG_TLS=m, so the kernel can be asked to offload the TLS record layer here — which the
+# coordinator container cannot do (setsockopt(SOL_TLS, TLS_TX) -> errno 92 ENOPROTOOPT there).
+#
+# Two kernels are probed on purpose: 24.04 (6.8) and 22.04 (5.15) — the same pair the project
+# already treats as its floor, so the answer is "kTLS is usable at our floor, or it is not".
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'exp/ktls-probe/**'
+      - '.github/workflows/exp-ktls-probe.yml'
+  pull_request:
+    paths:
+      - 'exp/ktls-probe/**'
+      - '.github/workflows/exp-ktls-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: kTLS probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: kernel facts
+        run: |
+          set -x
+          uname -a
+          grep -w tls /proc/modules || echo "tls module not loaded"
+          modinfo tls 2>/dev/null | head -8 || echo "no modinfo for tls"
+          sudo modprobe tls && echo "modprobe tls: ok" || echo "modprobe tls: failed"
+          grep -w tls /proc/modules || echo "tls still not loaded"
+
+      - name: probe
+        run: |
+          set +e
+          python3 exp/ktls-probe/ktls_probe.py --payload-bytes 4194304 --reps 5 --json > /tmp/ktls.json
+          rc=$?
+          echo "probe exit code: $rc"
+          cat /tmp/ktls.json
+          echo "$rc" > /tmp/ktls.rc
+          # rc=2 means "kTLS not available on this kernel" — a result, not a CI failure.
+          # Any other non-zero code is a probe bug and must fail the job.
+          if [ "$rc" != "0" ] && [ "$rc" != "2" ]; then exit "$rc"; fi
+
+      - name: job summary
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, platform
+          print(f"### kTLS probe — `{os.environ.get('RUNNER_OS')}` / kernel `{platform.release()}`")
+          try:
+              r = json.load(open("/tmp/ktls.json"))
+          except Exception as e:
+              print(f"no probe JSON: {e}")
+              raise SystemExit(0)
+          print(f"- kernel: `{r['kernel']['release']}` ({r['kernel']['machine']}), "
+                f"`tls` module loaded: {r['kernel'].get('modules_tls')}")
+          print(f"- TLS_TX accepted: **{r['available']}** — {r['availability_detail']}")
+          if r["available"]:
+              print(f"- record header `{r.get('raw_prefix')}` ok: {r.get('record_header_ok')}, "
+                    f"plaintext hidden: {r.get('plaintext_hidden')}")
+              for arm in ("plain_summary", "ktls_summary"):
+                  s = r[arm]
+                  print(f"- {arm}: user {s['cpu_user_s']}s, sys {s['cpu_sys_s']}s, "
+                        f"wall {s['wall_s']}s, short reads {s['received_mismatch']}/{s['reps']}")
+          print(f"- verdict: **{r['verdict']}**")
+          PY
