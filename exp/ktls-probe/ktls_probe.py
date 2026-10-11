@@ -32,10 +32,12 @@ import os
 import platform
 import resource
 import socket
+import ssl
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 SOL_TLS = 282
@@ -193,10 +195,124 @@ def measure_sendfile(use_ktls: bool, payload_path: str, payload_bytes: int, reps
     return results
 
 
+def make_self_signed_cert(dirpath: str):
+    """One-day self-signed certificate for the userspace-TLS arm: (cert, key, error)."""
+    cert = os.path.join(dirpath, "ktls-probe.crt")
+    key = os.path.join(dirpath, "ktls-probe.key")
+    try:
+        r = subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key,
+             "-out", cert, "-days", "1", "-subj", "/CN=localhost"],
+            capture_output=True, text=True,
+        )
+    except OSError as e:
+        # No openssl CLI on PATH (this coordinator container, for one). Report the arm as
+        # skipped rather than crashing the run: the two sendfile arms still measure, and a
+        # skip with a reason is a result, not a failure.
+        return None, None, f"openssl CLI unavailable: {e}"
+    if r.returncode != 0:
+        return None, None, (r.stderr or r.stdout or "openssl req failed").strip()[:200]
+    return cert, key, None
+
+
+def ssl_pair(cert, key):
+    """Loopback pair with a completed handshake; the accepting side runs in a thread."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    holder = {}
+
+    def accept_side():
+        s, _ = srv.accept()
+        s.settimeout(30)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        holder["server"] = ctx.wrap_socket(s, server_side=True)
+
+    t = threading.Thread(target=accept_side, daemon=True)
+    t.start()
+    raw = socket.create_connection(srv.getsockname(), timeout=30)
+    cctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    cctx.check_hostname = False
+    cctx.verify_mode = ssl.CERT_NONE
+    client = cctx.wrap_socket(raw, server_hostname=None)
+    t.join(timeout=30)
+    srv.close()
+    return client, holder["server"]
+
+
+def measure_openssl(cert, key, payload_path: str, payload_bytes: int, reps: int,
+                    chunk: int = 4096):
+    """Userspace TLS: read the file and SSL_write it in `chunk`-sized pieces.
+
+    4096 is not arbitrary — it is `NXT_TLS_BUFFER_SIZE` (src/nxt_tls.h), the record the
+    userspace path builds today.  TLS cannot use sendfile(), so this arm pays the read,
+    the encrypt and the copy that kTLS removes; that is the comparison this harness exists
+    to make, and the reason a plaintext socket is the wrong yardstick.
+
+    The receiving side runs in a thread (a blocking SSL_write loop with no reader would
+    deadlock against the socket buffer); `getrusage(RUSAGE_SELF)` still covers every
+    thread, and the window ends when the peer has the plaintext, as in the sendfile arms.
+    """
+    results = []
+    for _ in range(reps):
+        client, server = ssl_pair(cert, key)
+        received = []
+
+        def drain():
+            try:
+                while True:
+                    b = server.recv(262144)
+                    if not b:
+                        break
+                    received.append(len(b))
+            except OSError:
+                pass
+
+        th = threading.Thread(target=drain, daemon=True)
+        th.start()
+        ru0 = resource.getrusage(resource.RUSAGE_SELF)
+        t0 = time.perf_counter()
+        sent = 0
+        with open(payload_path, "rb") as f:
+            while True:
+                piece = f.read(chunk)
+                if not piece:
+                    break
+                client.sendall(piece)
+                sent += len(piece)
+        while sum(received) < sent and time.perf_counter() - t0 < 60:
+            time.sleep(0.0005)
+        elapsed = time.perf_counter() - t0
+        ru1 = resource.getrusage(resource.RUSAGE_SELF)
+        try:
+            client.close()
+        except OSError:
+            pass
+        try:
+            server.close()
+        except OSError:
+            pass
+        th.join(timeout=2)
+        results.append({
+            "sent": sent,
+            "received": sum(received),
+            "cpu_user_s": ru1.ru_utime - ru0.ru_utime,
+            "cpu_sys_s": ru1.ru_stime - ru0.ru_stime,
+            "wall_s": elapsed,
+        })
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--payload-bytes", type=int, default=4 << 20)
     ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--openssl-chunk", type=int, default=4096,
+                    help="userspace-TLS write size; 4096 = NXT_TLS_BUFFER_SIZE")
+    ap.add_argument("--skip-openssl", action="store_true",
+                    help="run only the two sendfile arms")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -236,6 +352,21 @@ def main():
     try:
         report["plain"] = measure_sendfile(False, payload_path, args.payload_bytes, args.reps)
         report["ktls"] = measure_sendfile(True, payload_path, args.payload_bytes, args.reps)
+        if args.skip_openssl:
+            report["openssl"] = None
+            report["openssl_skip"] = "--skip-openssl"
+        else:
+            with tempfile.TemporaryDirectory() as d:
+                cert, key, err = make_self_signed_cert(d)
+                if err is not None:
+                    report["openssl"] = None
+                    report["openssl_skip"] = f"certificate not created: {err}"
+                else:
+                    report["openssl_version"] = ssl.OPENSSL_VERSION
+                    report["openssl_chunk"] = args.openssl_chunk
+                    report["openssl"] = measure_openssl(
+                        cert, key, payload_path, args.payload_bytes, args.reps,
+                        args.openssl_chunk)
     finally:
         os.unlink(payload_path)
 
@@ -251,9 +382,42 @@ def main():
 
     report["plain_summary"] = agg(report["plain"])
     report["ktls_summary"] = agg(report["ktls"])
+    if report.get("openssl"):
+        report["openssl_summary"] = agg(report["openssl"])
     report["verdict"] = ("kTLS works and sendfile() drives it"
                          if report["record_header_ok"] and report["plaintext_hidden"]
                          else "kTLS accepted the option but the transformation check FAILED")
+
+    # Normalise by plaintext moved: sendfile() hands over what fits, the TLS arms move the
+    # whole file, so totals are not comparable between arms without this.
+    def per_mib(arm):
+        if not arm:
+            return None
+        sent = sum(r["sent"] for r in arm)
+        wall = sum(r["wall_s"] for r in arm)
+        if not sent:
+            return None
+        mib = sent / (1 << 20)
+        return {
+            "mib": round(mib, 2),
+            "cpu_user_ms_per_mib": round(sum(r["cpu_user_s"] for r in arm) / mib * 1000, 3),
+            "cpu_sys_ms_per_mib": round(sum(r["cpu_sys_s"] for r in arm) / mib * 1000, 3),
+            "mib_per_s": round(mib / wall, 1) if wall else None,
+        }
+
+    report["per_mib"] = {name: per_mib(report.get(name))
+                         for name in ("plain", "ktls", "openssl")}
+    ktls_pm = report["per_mib"].get("ktls")
+    ossl_pm = report["per_mib"].get("openssl")
+    if ktls_pm and ossl_pm and ossl_pm["cpu_sys_ms_per_mib"]:
+        report["ktls_vs_openssl"] = {
+            "cpu_sys_ratio": round(ktls_pm["cpu_sys_ms_per_mib"]
+                                   / ossl_pm["cpu_sys_ms_per_mib"], 2),
+            "throughput_ratio": (round(ktls_pm["mib_per_s"] / ossl_pm["mib_per_s"], 2)
+                                 if ossl_pm["mib_per_s"] else None),
+            "note": ">1 on cpu_sys_ratio means kTLS spends more system CPU per MiB than "
+                    "userspace OpenSSL; <1 means it saves",
+        }
 
     if args.json:
         print(json.dumps(report, indent=1))
@@ -261,10 +425,22 @@ def main():
         print(f"kernel {report['kernel']['release']} ({report['kernel']['machine']})")
         print(f"record header {report['raw_prefix']} ok={report['record_header_ok']} "
               f"plaintext_hidden={report['plaintext_hidden']} raw_len={report['raw_len']}")
-        for arm in ("plain_summary", "ktls_summary"):
-            s = report[arm]
+        for arm in ("plain_summary", "ktls_summary", "openssl_summary"):
+            s = report.get(arm)
+            if not s:
+                continue
             print(f"{arm}: user={s['cpu_user_s']}s sys={s['cpu_sys_s']}s "
                   f"wall={s['wall_s']}s mismatch={s['received_mismatch']}/{s['reps']}")
+        for name, pm in report["per_mib"].items():
+            if pm:
+                print(f"{name}/MiB: user={pm['cpu_user_ms_per_mib']}ms "
+                      f"sys={pm['cpu_sys_ms_per_mib']}ms {pm['mib_per_s']} MiB/s")
+        if report.get("ktls_vs_openssl"):
+            r = report["ktls_vs_openssl"]
+            print(f"kTLS vs userspace OpenSSL: sys CPU x{r['cpu_sys_ratio']}, "
+                  f"throughput x{r['throughput_ratio']}")
+        if report.get("openssl_skip"):
+            print(f"userspace-TLS arm skipped: {report['openssl_skip']}")
         print(f"verdict: {report['verdict']}")
     return 0
 

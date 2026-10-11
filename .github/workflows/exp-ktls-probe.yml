@@ -71,9 +71,24 @@ jobs:
           if r["available"]:
               print(f"- record header `{r.get('raw_prefix')}` ok: {r.get('record_header_ok')}, "
                     f"plaintext hidden: {r.get('plaintext_hidden')}")
-              for arm in ("plain_summary", "ktls_summary"):
-                  s = r[arm]
+              for arm in ("plain_summary", "ktls_summary", "openssl_summary"):
+                  s = r.get(arm)
+                  if not s:
+                      continue
                   print(f"- {arm}: user {s['cpu_user_s']}s, sys {s['cpu_sys_s']}s, "
                         f"wall {s['wall_s']}s, short reads {s['received_mismatch']}/{s['reps']}")
+              for name, pm in r.get("per_mib", {}).items():
+                  if pm:
+                      print(f"- {name} per MiB: user {pm['cpu_user_ms_per_mib']}ms, "
+                            f"sys {pm['cpu_sys_ms_per_mib']}ms, {pm['mib_per_s']} MiB/s")
+              ratio = r.get("ktls_vs_openssl")
+              if ratio:
+                  print(f"- kTLS vs userspace OpenSSL: sys CPU x{ratio['cpu_sys_ratio']}, "
+                        f"throughput x{ratio['throughput_ratio']}")
+              if r.get("openssl_version"):
+                  print(f"- userspace TLS arm: `{r['openssl_version']}`, "
+                        f"{r.get('openssl_chunk')}-byte writes")
+              if r.get("openssl_skip"):
+                  print(f"- userspace TLS arm skipped: {r['openssl_skip']}")
           print(f"- verdict: **{r['verdict']}**")
           PY
