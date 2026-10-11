@@ -79,17 +79,54 @@ decides anything for FreeUnit is kTLS against **userspace OpenSSL**, which is wh
 **mechanism** and a **cost baseline** (~0.8–0.9 ms of system CPU per MiB of encrypted plaintext,
 ~1.0–1.2 GiB/s through `sendfile()` on a shared runner), not the win.
 
-Step 1b, before any FreeUnit code moves: add the OpenSSL arm to the same harness (same loopback pair,
-same payload, `SSL_write` in 4 KiB records) so a three-way comparison exists.
+### Step 1b — userspace TLS, the arm that decides (run 38170607310, both legs green)
+
+Same loopback pair, same payload, `SSL_write` in 4 KiB pieces (`NXT_TLS_BUFFER_SIZE`), OpenSSL
+version recorded per runner. Normalised by plaintext moved:
+
+| Arm | ubuntu-24.04 / k6.17 / OpenSSL 3.0.13 | ubuntu-22.04 / k6.8 / OpenSSL 3.0.2 |
+|---|---|---|
+| plain socket | 0.058 ms user + 0.293 ms sys per MiB — 2 875 MiB/s | 0.055 + 0.178 — 4 345 MiB/s |
+| kTLS (`sendfile()`) | 0.100 + 0.714 — 1 232 MiB/s | 0.040 + 0.649 — 1 458 MiB/s |
+| **userspace OpenSSL, 4 KiB writes** | **3.309 + 3.214 — 69.5 MiB/s** | **3.649 + 2.066 — 69.5 MiB/s** |
+
+**kTLS against userspace OpenSSL, measured: 17.7× (k6.17) and 21.0× (k6.8) more plaintext per second,
+4.5× and 3.2× less system CPU per MiB, and roughly 30× less user CPU** (3.3 ms → 0.1 ms per MiB:
+the record loop and the encryption leave the process entirely).
+
+Caveats, stated because they bound the claim:
+
+- The OpenSSL arm is driven from Python (`ssl`, on top of the same OpenSSL), so its absolute figure
+  carries per-call interpreter overhead that a C `SSL_write` loop would not pay. What it measures
+  structurally — one read + one encrypt + one write per 4 KiB record, against one `sendfile()` — is
+  the shape FreeUnit's static-over-TLS path has today.
+- The sendfile arms hand over what fits per call (~2.5 MiB of the 4 MiB requested), so their totals
+  are smaller than the OpenSSL arm's 20 MiB. That is why the report normalises per MiB and why the
+  **ratios, not the totals, are the result**.
+- Loopback on a shared runner: absolute MiB/s will differ on real hardware, and device offload — not
+  exercised here — can move more of it to the NIC.
+
+The probe now prints these ratios itself (`per_mib`, `ktls_vs_openssl`) in the JSON and in the job
+summary, so the next run does not need this note to be read.
 
 ## Decision gate
 
-- **Both legs green** (option accepted, transformation true, `sendfile()` drives it, CPU not worse) →
-  step 2 is worth building: the `auto/ktls` build probe, the runtime probe, and a kTLS
-  `nxt_conn_io_t` variant behind an explicit opt-in, with a cipher gate and a fallback to the
-  existing userspace path.
-- **5.15 red** → kTLS becomes an opt-in for newer kernels only, or the track stops here. Either way
-  the verdict is written into this file, with the numbers.
+**The gate is passed, with the numbers above.** Both legs agree: kTLS is ~18–21× the throughput of
+the userspace OpenSSL path it would replace, with ~3–4.5× less system CPU and ~30× less user CPU per
+MiB, on two kernels (6.17 and 6.8) and two OpenSSL versions (3.0.13, 3.0.2). Step 2 is therefore
+justified: `auto/ktls` build probe, runtime probe, and a kTLS `nxt_conn_io_t` behind an explicit
+opt-in with a cipher gate and a fallback to the existing path.
+
+Two things the numbers do **not** settle, and step 2 must:
+
+- the Python-driven OpenSSL arm sets the floor, not the ceiling, of the userspace path — a C driver
+  narrows the gap. The structural gain (no per-record read/encrypt/copy in the worker) survives that,
+  but the multiplier will be smaller against a C-level comparison; measure before quoting a factor.
+- nothing here says the freed CPU shows up as capacity under a real listener: that needs FreeUnit
+  itself, i.e. step 2, not this harness.
+
+The version decision is unchanged: `tls.ktls` is API surface, so it ships in a **minor** and never in
+a 1.37.x patch.
 
 ## What this does not decide
 
