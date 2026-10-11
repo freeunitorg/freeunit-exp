@@ -36,6 +36,7 @@ Exit status
     3  no TLS 1.3 session or no certificate (nothing to offload)
 """
 import argparse
+import errno
 import hashlib
 import hmac
 import json
@@ -185,22 +186,32 @@ def handshake_tls13(cert, key, keylog_path):
 
 
 def install_tx(sock, cipher_type, key, iv, seq):
-    """TLS_TX with an explicit record sequence; returns (ok, detail)."""
+    """TLS_TX with an explicit record sequence; returns (ok, detail).
+
+    `tcp_set_ulp()` answers **EEXIST** when a ULP is already attached to the socket. Both CI
+    runners did exactly that while the local kernel did not, so the state is reported instead
+    of assumed: an already-attached TLS ULP is what TLS_TX needs anyway, and only a different
+    error means the kernel cannot do this at all.
+    """
     info = struct.pack("H H 8s 32s 4s 8s", TLS_1_3_VERSION, cipher_type,
                        iv[4:12], key.ljust(32, b"\x00"), iv[0:4], struct.pack("Q", seq))
     # key length varies per suite; rebuild the struct for the 16-byte case
     if len(key) == 16:
         info = struct.pack("H H 8s 16s 4s 8s", TLS_1_3_VERSION, cipher_type,
                            iv[4:12], key, iv[0:4], struct.pack("Q", seq))
+    ulp = "set-by-probe"
     try:
         sock.setsockopt(socket.IPPROTO_TCP, TCP_ULP, b"tls\x00")
     except OSError as e:
-        return False, f"TCP_ULP=tls failed: {e.errno} {e.strerror}"
+        if e.errno == errno.EEXIST:
+            ulp = "preexisting"
+        else:
+            return False, f"TCP_ULP=tls failed: {e.errno} {e.strerror}"
     try:
         sock.setsockopt(SOL_TLS, TLS_TX, info)
     except OSError as e:
-        return False, f"TLS_TX failed: {e.errno} {e.strerror}"
-    return True, "TLS_TX accepted"
+        return False, f"TLS_TX failed: {e.errno} {e.strerror} (ulp {ulp})"
+    return True, f"TLS_TX accepted (ulp {ulp})"
 
 
 def try_seq(cert, key, seq, payload, tmpdir):
