@@ -147,18 +147,18 @@ def measure_sendfile(use_ktls: bool, payload_path: str, payload_bytes: int, reps
         client, server = tcp_pair()
         if use_ktls:
             enable_ktls_tx(client)
-        # Drain in a thread-free way: read until the expected amount of raw bytes arrives.
-        # sendfile() over kTLS emits records of at most 2^14 plaintext, each carrying a
-        # 5-byte record header and a 16-byte GCM tag, so the wire size is the plaintext
-        # plus ~21 bytes per record.
-        expected = payload_bytes if not use_ktls else payload_bytes + (payload_bytes // 16384 + 2) * 21
         received = 0
         fd = os.open(payload_path, os.O_RDONLY)
         ru0 = resource.getrusage(resource.RUSAGE_SELF)
         t0 = time.perf_counter()
         sent = os.sendfile(client.fileno(), fd, None, payload_bytes)
         os.close(fd)
-        while received < expected:
+        # Drain exactly what sendfile() handed to the socket. It returns short once the
+        # socket buffer is full; waiting for the requested payload instead just sits in the
+        # recv timeout — the first run of this probe measured 5 x 10 s of nothing while
+        # every byte had already arrived (and reported clean short-read counters, so the
+        # timing columns looked plausible).
+        while received < sent:
             try:
                 chunk = server.recv(262144)
             except socket.timeout:
@@ -168,6 +168,18 @@ def measure_sendfile(use_ktls: bool, payload_path: str, payload_bytes: int, reps
             received += len(chunk)
         elapsed = time.perf_counter() - t0
         ru1 = resource.getrusage(resource.RUSAGE_SELF)
+        # On the kTLS arm the record overhead (5-byte header + 16-byte GCM tag per 2^14
+        # record) rides behind the plaintext; drain it OUTSIDE the measured window so both
+        # arms are timed to the same number of plaintext bytes.
+        server.settimeout(0.3)
+        while True:
+            try:
+                chunk = server.recv(262144)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            received += len(chunk)
         client.close()
         server.close()
         results.append({
