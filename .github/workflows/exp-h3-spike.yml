@@ -1,0 +1,35 @@
+name: exp-h3-spike
+
+# HTTP/3 spike: one request over QUIC on loopback, measured.
+# A userspace stack answers "does the transport work here" before any core work.
+# Path-filtered: it does not touch the server's own jobs.
+
+on:
+  push:
+    paths:
+      - 'exp/h3-spike/**'
+      - '.github/workflows/exp-h3-spike.yml'
+  pull_request:
+    paths:
+      - 'exp/h3-spike/**'
+      - '.github/workflows/exp-h3-spike.yml'
+
+jobs:
+  spike:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: install the stack
+        run: pip install aioquic==1.4.0
+
+      - name: versions
+        run: python3 -c "import sys, aioquic; print(sys.version.split()[0], 'aioquic', aioquic.__version__ if hasattr(aioquic,'__version__') else '1.4.0')"
+
+      - name: run the spike
+        working-directory: exp/h3-spike
+        run: python3 h3_spike.py
