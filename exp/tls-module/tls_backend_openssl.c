@@ -232,10 +232,12 @@ nxt_tls_backend_selftest(const char *crt, const char *key,
     server = ctx_create(1);
     client = ctx_create(0);
     if (server == NULL || client == NULL) {
+        fprintf(stderr, "selftest: ctx_create failed\n");
         return -1;
     }
 
     if (ctx_set_cert(server, crt, key) != 0) {
+        fprintf(stderr, "selftest: certificate or key load failed\n");
         return -1;
     }
 
@@ -243,21 +245,25 @@ nxt_tls_backend_selftest(const char *crt, const char *key,
         const char  *server_protos[] = { "h2", "http/1.1" };
 
         if (ctx_set_alpn(server, server_protos, 2) != 0) {
+            fprintf(stderr, "selftest: server ALPN setup failed\n");
             return -1;
         }
     }
 
     if (n > 0 && ctx_set_alpn(client, client_alpn, n) != 0) {
+        fprintf(stderr, "selftest: client ALPN setup failed\n");
         return -1;
     }
 
     if (BIO_new_bio_pair(&cbio, 0, &sbio, 0) != 1) {
+        fprintf(stderr, "selftest: bio pair failed\n");
         return -1;
     }
 
     cssl = SSL_new(client->ctx);
     sssl = SSL_new(server->ctx);
     if (cssl == NULL || sssl == NULL) {
+        fprintf(stderr, "selftest: SSL_new failed\n");
         return -1;
     }
 
@@ -268,18 +274,44 @@ nxt_tls_backend_selftest(const char *crt, const char *key,
 
     rc = -1;
 
-    for (i = 0; i < 100; i++) {
+    for (i = 0; i < 500; i++) {
+        int  cr = 1, sr = 1;
+
         if (!SSL_is_init_finished(cssl)) {
-            SSL_do_handshake(cssl);
+            cr = SSL_do_handshake(cssl);
         }
 
         if (!SSL_is_init_finished(sssl)) {
-            SSL_do_handshake(sssl);
+            sr = SSL_do_handshake(sssl);
         }
 
         if (SSL_is_init_finished(cssl) && SSL_is_init_finished(sssl)) {
             rc = 0;
             break;
+        }
+
+        if (cr < 1 && SSL_get_error(cssl, cr) != SSL_ERROR_WANT_READ
+            && SSL_get_error(cssl, cr) != SSL_ERROR_WANT_WRITE)
+        {
+            fprintf(stderr, "client handshake error %d\n",
+                    SSL_get_error(cssl, cr));
+            break;
+        }
+
+        if (sr < 1 && SSL_get_error(sssl, sr) != SSL_ERROR_WANT_READ
+            && SSL_get_error(sssl, sr) != SSL_ERROR_WANT_WRITE)
+        {
+            fprintf(stderr, "server handshake error %d\n",
+                    SSL_get_error(sssl, sr));
+            break;
+        }
+    }
+
+    if (rc != 0) {
+        unsigned long  e;
+
+        while ((e = ERR_get_error()) != 0) {
+            fprintf(stderr, "openssl: %s\n", ERR_error_string(e, NULL));
         }
     }
 
