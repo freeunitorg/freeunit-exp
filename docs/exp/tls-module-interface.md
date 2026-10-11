@@ -50,10 +50,27 @@ empty protocol instead of "no acknowledgement" breaks the plain HTTP/1 client.
 
 ## Result
 
-Filled from the CI run of this branch (see the pull request checks for
-`exp-tls-module`). The prototype pins TLS 1.2 on purpose: in TLS 1.3 a
-"no acknowledgement" from the ALPN callback is a different code path, and this
-prototype only needs the 1.2 semantics that the current callback relies on.
+From the CI run of branch `hermes/tls-module-proto` (clean Ubuntu runner,
+OpenSSL 3.5.5, cc 15.2.0), `make test` in `exp/tls-module`:
+
+```
+PASS  interface                    backend="openssl" version=1
+PASS  client offers no ALPN        negotiated ""
+PASS  client offers http/1.1       negotiated "http/1.1"
+PASS  client offers h2             negotiated "h2"
+OK (0 failures)
+```
+
+What the run also found, and it is the useful part: the first version selected
+`*out = p` instead of `*out = p + 1`, so the one-byte length prefix leaked into
+the protocol name in the ServerHello. The client decoded a malformed extension and
+answered with a decode error alert. The no-ALPN case passing while the ALPN cases
+failed located the fault in the ALPN extension and nowhere else. Any implementation
+of this interface, in any language, meets the same trap.
+
+The prototype pins TLS 1.2 on purpose: in TLS 1.3 a "no acknowledgement" from the
+ALPN callback is a different code path, and this prototype only needs the 1.2
+semantics that the current callback relies on.
 
 ## Migration path
 
