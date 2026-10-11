@@ -77,14 +77,12 @@ main(int argc, char **argv)
            b->version);
 
     {
-        const char  *offer[] = { "h2", "http/1.1" };
-
-        rc = selftest(argv[1], argv[2], offer, 2, got, sizeof(got));
+        rc = selftest(argv[1], argv[2], NULL, 0, got, sizeof(got));
         if (rc != 0) {
-            printf("FAIL  handshake h2,http/1.1 did not complete\n");
+            printf("FAIL  handshake without ALPN did not complete\n");
             return 1;
         }
-        check("client offers h2", got, "h2");
+        check("client offers no ALPN", got, "");
     }
 
     {
@@ -98,12 +96,16 @@ main(int argc, char **argv)
         check("client offers http/1.1", got, "http/1.1");
     }
 
-    rc = selftest(argv[1], argv[2], NULL, 0, got, sizeof(got));
-    if (rc != 0) {
-        printf("FAIL  handshake without ALPN did not complete\n");
-        return 1;
+    {
+        const char  *offer[] = { "h2", "http/1.1" };
+
+        rc = selftest(argv[1], argv[2], offer, 2, got, sizeof(got));
+        if (rc != 0) {
+            printf("FAIL  handshake h2,http/1.1 did not complete\n");
+            return 1;
+        }
+        check("client offers h2", got, "h2");
     }
-    check("client offers no ALPN", got, "");
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures,
            failures == 1 ? "" : "s");
