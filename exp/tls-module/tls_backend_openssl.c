@@ -61,13 +61,14 @@ alpn_select(SSL *ssl, const unsigned char **out, unsigned char *outlen,
 
     (void) ssl;
 
-    /* in: sequence of (1-byte length, bytes). First server match wins. */
+    /* in: sequence of (1-byte length, bytes). First server match wins.
+     * *out points at the protocol NAME; the length byte stays behind. */
     for (p = in, end = in + inlen; p < end && *p > 0; p += 1 + *p) {
         for (i = 0; i < c->nprotos; i++) {
             if ((size_t) *p == strlen(c->protos[i])
                 && memcmp(p + 1, c->protos[i], *p) == 0)
             {
-                *out = p;
+                *out = p + 1;
                 *outlen = *p;
                 return SSL_TLSEXT_ERR_OK;
             }
