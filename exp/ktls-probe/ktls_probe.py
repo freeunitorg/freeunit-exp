@@ -44,6 +44,8 @@ TLS_RX = 2
 TLS_CIPHER_AES_GCM_128 = 51
 TLS_1_2_VERSION = 0x0303
 TLS_RECORD_HEADER = b"\x17\x03\x03"      # application_data, TLS 1.2, length follows
+SOL_TCP = 6
+TCP_ULP = 31                             # SOL_TCP/TCP_ULP: set the TLS upper-layer protocol
 
 
 def crypto_info(rec_seq: int = 0) -> bytes:
@@ -92,14 +94,43 @@ def kernel_facts():
     return facts
 
 
+def enable_ktls_tx(sock) -> tuple:
+    """Install TLS_TX on a connected socket; report which route the kernel took.
+
+    The documented sequence sets the TLS ULP first (Documentation/networking/tls.rst:
+    "once the connection is established set the TLS ULP … Setting the TLS ULP allows us to
+    set/get TLS socket options").  Kernel-side, `tls_init(sk)` is the ULP's `.init`: it
+    requires `TCP_ESTABLISHED`, creates the `tls_context` and swaps `sk_prot` to a TLS
+    proto — and only then does `setsockopt(SOL_TLS, …)` reach `do_tls_setsockopt`.
+
+    Without the ULP the option never reaches the TLS code at all: the socket layer answers
+    the generic ENOPROTOOPT.  That is what the first version of this probe measured — the
+    same errno on the coordinator and on both CI kernels — and it was a probe bug, not the
+    kernel.  Both routes are therefore tried and reported.
+    """
+    try:
+        sock.setsockopt(SOL_TLS, TLS_TX, crypto_info())
+        return "direct", "TLS_TX accepted without the TLS ULP"
+    except OSError as e:
+        direct = f"direct TLS_TX failed: {e.errno} {e.strerror}"
+
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, TCP_ULP, b"tls\x00")
+    except OSError as e:
+        raise RuntimeError(f"{direct}; TCP_ULP=tls failed: {e.errno} {e.strerror}")
+
+    sock.setsockopt(SOL_TLS, TLS_TX, crypto_info())
+    return "ulp", f"{direct}; accepted after TCP_ULP=tls"
+
+
 def probe_availability():
-    """Can the socket layer accept TLS_TX at all? Returns (ok, detail)."""
+    """Can the socket layer accept TLS_TX at all? Returns (ok, detail, route)."""
     client, server = tcp_pair()
     try:
-        client.setsockopt(SOL_TLS, TLS_TX, crypto_info())
-        return True, "TLS_TX accepted"
-    except OSError as e:
-        return False, f"setsockopt(SOL_TLS, TLS_TX) failed: {e.errno} {e.strerror}"
+        route, detail = enable_ktls_tx(client)
+        return True, detail, route
+    except (OSError, RuntimeError) as e:
+        return False, str(e), None
     finally:
         client.close()
         server.close()
@@ -115,9 +146,12 @@ def measure_sendfile(use_ktls: bool, payload_path: str, payload_bytes: int, reps
     for _ in range(reps):
         client, server = tcp_pair()
         if use_ktls:
-            client.setsockopt(SOL_TLS, TLS_TX, crypto_info())
+            enable_ktls_tx(client)
         # Drain in a thread-free way: read until the expected amount of raw bytes arrives.
-        expected = payload_bytes if not use_ktls else payload_bytes + (payload_bytes // 16384 + 2) * 5 + 29
+        # sendfile() over kTLS emits records of at most 2^14 plaintext, each carrying a
+        # 5-byte record header and a 16-byte GCM tag, so the wire size is the plaintext
+        # plus ~21 bytes per record.
+        expected = payload_bytes if not use_ktls else payload_bytes + (payload_bytes // 16384 + 2) * 21
         received = 0
         fd = os.open(payload_path, os.O_RDONLY)
         ru0 = resource.getrusage(resource.RUSAGE_SELF)
@@ -156,9 +190,10 @@ def main():
 
     report = {"kernel": kernel_facts(), "sol_tls": SOL_TLS, "tls_tx": TLS_TX}
 
-    ok, detail = probe_availability()
+    ok, detail, route = probe_availability()
     report["available"] = ok
     report["availability_detail"] = detail
+    report["route"] = route
 
     if not ok:
         report["verdict"] = "kTLS NOT available on this kernel (no TLS protocol handler)"
@@ -172,7 +207,7 @@ def main():
 
     # 1. transformation check: the receiver must see a TLS record, not the plaintext.
     client, server = tcp_pair()
-    client.setsockopt(SOL_TLS, TLS_TX, crypto_info())
+    enable_ktls_tx(client)
     marker = b"ktls-probe-plaintext-marker"
     client.sendall(marker)
     raw = server.recv(4096)
