@@ -207,8 +207,12 @@ static int nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id);
 static ssize_t nxt_unit_port_send(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port, const void *buf, size_t buf_size,
     const nxt_send_oob_t *oob);
+static ssize_t nxt_unit_port_send_flags(nxt_unit_ctx_t *ctx,
+    nxt_unit_port_t *port, const void *buf, size_t buf_size,
+    const nxt_send_oob_t *oob, int flags);
 static ssize_t nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
-    int fd, const void *buf, size_t buf_size, const nxt_send_oob_t *oob);
+    int fd, const void *buf, size_t buf_size, const nxt_send_oob_t *oob,
+    int flags);
 static int nxt_unit_ctx_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf);
 nxt_inline void nxt_unit_rbuf_cpy(nxt_unit_read_buf_t *dst,
@@ -5633,7 +5637,16 @@ nxt_unit_awake_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
 
     msg.type = _NXT_PORT_MSG_RPC_READY;
 
-    (void) nxt_unit_port_send(ctx, port, &msg, sizeof(msg), NULL);
+    /*
+     * This is a wake-up, not data, and the caller is often the thread that
+     * frees a context and must make progress: if the target stopped reading,
+     * its socket is full, and a blocking send here hangs the worker at quit
+     * (issue 663).  MSG_DONTWAIT bounds it; the target is already readable in
+     * exactly that case, so the nudge is not needed.  The port reference stays
+     * held by the caller for the lifetime of this call.
+     */
+    (void) nxt_unit_port_send_flags(ctx, port, &msg, sizeof(msg), NULL,
+                                    MSG_DONTWAIT);
 }
 
 
@@ -7950,8 +7963,8 @@ nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id)
 
 
 static ssize_t
-nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
-    const void *buf, size_t buf_size, const nxt_send_oob_t *oob)
+nxt_unit_port_send_flags(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
+    const void *buf, size_t buf_size, const nxt_send_oob_t *oob, int flags)
 {
     int                   notify;
     ssize_t               ret;
@@ -8003,7 +8016,7 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
 
             if (lib->callbacks.port_send == NULL) {
                 ret = nxt_unit_sendmsg(ctx, port, port->out_fd, &msg,
-                                       sizeof(nxt_port_msg_t), NULL);
+                                       sizeof(nxt_port_msg_t), NULL, flags);
 
                 nxt_unit_debug(ctx, "port{%d,%d} send %d read_queue",
                                (int) port->id.pid, (int) port->id.id,
@@ -8048,7 +8061,8 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
                        (int) ret);
 
     } else {
-        ret = nxt_unit_sendmsg(ctx, port, port->out_fd, buf, buf_size, oob);
+        ret = nxt_unit_sendmsg(ctx, port, port->out_fd, buf, buf_size, oob,
+                               flags);
 
         nxt_unit_debug(ctx, "port{%d,%d} sendmsg %d",
                        (int) port->id.pid, (int) port->id.id,
@@ -8060,8 +8074,16 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
 
 
 static ssize_t
-nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int fd,
+nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     const void *buf, size_t buf_size, const nxt_send_oob_t *oob)
+{
+    return nxt_unit_port_send_flags(ctx, port, buf, buf_size, oob, 0);
+}
+
+
+static ssize_t
+nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int fd,
+    const void *buf, size_t buf_size, const nxt_send_oob_t *oob, int flags)
 {
     int                  err;
     ssize_t              n;
@@ -8074,13 +8096,29 @@ nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int fd,
 
 retry:
 
-    n = nxt_sendmsg(fd, iov, 1, oob);
+    n = nxt_sendmsg(fd, iov, 1, oob, flags);
 
     if (nxt_slow_path(n == -1)) {
         err = errno;
 
         if (err == EINTR) {
             goto retry;
+        }
+
+        /*
+         * A wake-up that cannot be delivered over a full socket is not a lost
+         * wake-up: this is a datagram socket, so a full send buffer means
+         * unread datagrams are already queued at the peer, whose poll() then
+         * returns without the nudge.  A caller that asked for a non-blocking
+         * send (a wake-up in nxt_unit_ctx_free_rbufs()) must not hang on that,
+         * so EAGAIN ends here with a debug line instead of a retry.
+         */
+        if ((flags & MSG_DONTWAIT) != 0 && err == EAGAIN) {
+            nxt_unit_debug(ctx, "sendmsg(%d, %d): peer already has readable "
+                           "data, non-blocking wake-up dropped",
+                           fd, (int) buf_size);
+
+            return 0;
         }
 
         /*
