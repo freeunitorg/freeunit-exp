@@ -109,6 +109,33 @@ Caveats, stated because they bound the claim:
 The probe now prints these ratios itself (`per_mib`, `ktls_vs_openssl`) in the JSON and in the job
 summary, so the next run does not need this note to be read.
 
+### Step 2a — the key path, on CI (run 38174462640, both legs green)
+
+`exp/ktls-probe/ktls_keys_probe.py`: a real TLS 1.3 handshake whose keylog secret is turned into
+`TLS_TX` parameters by HKDF-Expand-Label, after which the plaintext leaves through the raw fd and
+the **OpenSSL server** has to decrypt it.
+
+| Runner | kernel | OpenSSL | record sequence accepted | multi-record burst |
+|---|---|---|---|---|
+| ubuntu-22.04 | 6.8.0-1064-azure | 3.0.2 | **0** | 262 144 B in 7 KiB writes, all back, 86.6 MiB/s |
+| ubuntu-24.04 | 6.17.0-1022-azure | 3.0.13 | **0** | 262 144 B in 7 KiB writes, all back, 97.5 MiB/s |
+
+Both legs: `kernel-produced TLS record accepted by OpenSSL at record sequence 0
+(TLS_AES_256_GCM_SHA384)`. Two facts this settles for the C side:
+
+- **the application-data record sequence of a TLS 1.3 connection starts at 0** — it does not carry
+  over from the handshake records, because the sequence is per key epoch. Nothing has to count
+  handshake records, which was the main unknown in the design;
+- the kernel's own records, built from keys derived outside OpenSSL, are accepted by OpenSSL
+  unchanged — the interface between the two stacks is the key material, not a callback.
+
+**Open question, recorded rather than explained:** before the fix in `bf7f8d20`, both runners
+answered `TCP_ULP=tls` with **EEXIST** while the local kernel answered success — something in the
+OpenSSL/Python stack on those images had already attached the TLS ULP. The probe now treats EEXIST
+as the state it wants (it is), and the run above passes, but *why* those images pre-attach the ULP
+is not established, and the ULP state is not printed on the success path. Worth knowing before the C
+side assumes it always sets the ULP itself.
+
 ## Decision gate
 
 **The gate is passed, with the numbers above.** Both legs agree: kTLS is ~18–21× the throughput of
