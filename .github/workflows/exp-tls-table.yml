@@ -57,10 +57,13 @@ jobs:
 
       - name: Configure and build the python module
         run: |
-          sudo ./configure python
+          prefix="$(python3 -c 'import sys; print(sys.base_prefix)')"
+          sudo ./configure python \
+            --config="${prefix}/bin/python3-config" \
+            --lib-path="${prefix}/lib"
           sudo make python3
 
-      - name: Build fake_otlp and fix permissions
+      - name: Fix permissions
         run: |
           sudo chmod -R +x "$HOME"
           namei -l "$PWD"
