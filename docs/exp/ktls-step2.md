@@ -52,9 +52,30 @@ the TLS backend, which is why this file only knows how to hand the kernel a `cry
   measures end to end, and a test that only re-runs `nxt_ktls_supported()` would assert the
   runner's kernel rather than the code. The test belongs with the data path.
 
-## How this increment is verified
+## Verified in CI (run 38190157060, every job green)
 
-CI compiles `src/nxt_ktls.c` through the project's own Build & Test on the pull request, which is
-also what exercises the new `configure` step on two Linux images (and the no-TLS build, where the
-file is not compiled at all). The runtime semantics are verified by `exp/ktls-probe/` — the Python
-probes that measure the same interface without depending on FreeUnit's plumbing.
+```
+checking for Linux kTLS (SOL_TLS, TLS_TX/TLS_RX) ... found
+  CC     build/src/nxt_ktls.o
+  CC     build/src/test/nxt_ktls_test.o
+  CC     build/src/nxt_ktls.test.o
+tests: [notice] kTLS offload: supported by this kernel
+```
+
+Four lines, four separate claims: the build probe finds the interface; the source is compiled; the
+test is linked; and the runtime probe, executed by the test runner on the CI kernel, answers
+"supported". Build & Test (macOS) and the no-TLS build stay green — there the file is not compiled
+at all.
+
+## The bug this caught, and why the test exists
+
+The first version of `auto/ktls` did not set the shell variable `NXT_HAVE_KTLS`. `auto/feature`
+defines the macro in the generated header but **not** the shell variable, so the `auto/sources`
+condition never fired and `src/nxt_ktls.c` never joined `NXT_LIB_SRCS` — **every CI job was green
+and the new file was never compiled.** A compiler would not have caught it: there was nothing to
+compile.
+
+Two changes follow from that: the probe now sets the variable the way the sendfile probe beside it
+does, and `src/test/nxt_ktls_test.c` references `nxt_ktls_supported()` so that a missing file fails
+to link instead of hiding behind a green build. The test asserts nothing about the machine —
+whether a kernel offloads is the kernel's business, and the log line says which it is.
