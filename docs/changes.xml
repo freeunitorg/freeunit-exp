@@ -278,6 +278,19 @@ is not affected.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+an embedded Python interpreter could load the standard library of another
+Python.  When an application had no "home" option, the interpreter was
+isolated and got neither a program name nor a home, so it located the
+standard library through the default search; a Python installed outside the
+system prefix then loaded the system standard library as soon as the minor
+versions matched, and imports failed for the modules that differed.  The
+prefix that the module is built with is now recorded at configure time and
+used as the default home.  An explicit "home" still wins.
+</para>
+</change>
+
 </changes>
 
 

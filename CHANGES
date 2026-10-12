@@ -195,6 +195,16 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        than FreeUnit that links that file and calls the component API no
        longer loads. The wasm-wasi-component module is not affected.
 
+    *) Bugfix: an embedded Python interpreter could load the standard
+       library of another Python.  When an application had no "home"
+       option, the interpreter was isolated and got neither a program
+       name nor a home, so it located the standard library through the
+       default search; a Python installed outside the system prefix then
+       loaded the system standard library as soon as the minor versions
+       matched, and imports failed for the modules that differed.  The
+       prefix that the module is built with is now recorded at configure
+       time and used as the default home.  An explicit "home" still wins.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 

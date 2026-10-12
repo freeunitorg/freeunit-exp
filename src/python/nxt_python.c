@@ -228,6 +228,45 @@ nxt_python_start(nxt_task_t *task, nxt_process_data_t *data)
         nxt_memcpy(nxt_py_home, c->home, len + 1);
         Py_SetPythonHome(nxt_py_home);
 #endif
+
+    } else {
+#ifdef NXT_PYTHON_BASE_PREFIX
+        /*
+         * No "home" in the application configuration.  The interpreter is
+         * isolated and is given neither "program_name" nor "home", so it finds
+         * its standard library through the default search; a Python installed
+         * outside the system prefix then loads the system standard library as
+         * soon as the minor versions match.  Pin it to the prefix recorded at
+         * configure time.  An explicit "home" still wins.
+         */
+        len = sizeof(NXT_PYTHON_BASE_PREFIX) - 1;
+
+#if PY_MAJOR_VERSION == 3
+        nxt_py_home = nxt_malloc((len + 1) * sizeof(wchar_t));
+        if (nxt_slow_path(nxt_py_home == NULL)) {
+            nxt_alert(task, "Failed to allocate memory");
+            return NXT_ERROR;
+        }
+
+        mbstowcs(nxt_py_home, NXT_PYTHON_BASE_PREFIX, len + 1);
+
+        ret = nxt_python3_init_config(0);
+        if (nxt_slow_path(ret == NXT_ERROR)) {
+            nxt_alert(task, "Failed to initialise config");
+            return NXT_ERROR;
+        }
+
+#else
+        nxt_py_home = nxt_malloc(len + 1);
+        if (nxt_slow_path(nxt_py_home == NULL)) {
+            nxt_alert(task, "Failed to allocate memory");
+            return NXT_ERROR;
+        }
+
+        nxt_memcpy(nxt_py_home, NXT_PYTHON_BASE_PREFIX, len + 1);
+        Py_SetPythonHome(nxt_py_home);
+#endif
+#endif /* NXT_PYTHON_BASE_PREFIX */
     }
 
     Py_InitializeEx(0);
