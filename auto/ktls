@@ -32,3 +32,11 @@ nxt_feature_test="#include <sys/socket.h>
                              + TCP_ULP;
                   }"
 . auto/feature
+
+
+# The shell variable is what auto/sources tests to add src/nxt_ktls.c to NXT_LIB_SRCS;
+# auto/feature only defines the macro in the generated header.  Without this line the file
+# is never compiled, the build stays green, and nothing exercises it.
+if [ $nxt_found = yes ]; then
+    NXT_HAVE_KTLS=YES
+fi

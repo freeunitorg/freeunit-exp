@@ -149,8 +149,10 @@ nxt_ktls_supported(nxt_task_t *task)
 
     nxt_ktls_probe = nxt_ktls_try(&info);
 
-    nxt_log_debug(task->log, "kTLS: %s",
-                  (nxt_ktls_probe == NXT_OK) ? "supported" : "not available");
+    if (task != NULL) {
+        nxt_log_debug(task->log, "kTLS: %s",
+                      (nxt_ktls_probe == NXT_OK) ? "supported" : "not available");
+    }
 
     return nxt_ktls_probe;
 }

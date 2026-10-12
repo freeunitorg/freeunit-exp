@@ -166,6 +166,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_rbtree_test.c \
     src/test/nxt_term_parse_test.c \
     src/test/nxt_msec_diff_test.c \
+    src/test/nxt_ktls_test.c \
     src/test/nxt_mp_test.c \
     src/test/nxt_lvlhsh_test.c \
     src/test/nxt_gmtime_test.c \
