@@ -23,9 +23,13 @@
  *     (RFC 5246, sections 5 and 6.3), where the AEAD layout puts the client write key first
  *     and the client write IV after both write keys.
  *
- * The record sequence is deliberately not derived here: for TLS 1.3 the application-data
- * epoch starts at 0 (measured, see docs/exp/ktls-verdict.md), and what TLS 1.2 does at the
- * same point has to be measured the same way before that path is switched on.
+ * The record sequence is deliberately not derived here, and the side matters.  The TLS 1.3
+ * measurement (application data starts at 0) used a client TX key; a TLS 1.3 server sends its
+ * session tickets under the application traffic key before any data, so a server TX sequence is
+ * not 0.  In TLS 1.2 the encrypted Finished takes sequence 0, so the first application-data
+ * record is 1 - measured with the salt wired correctly, the peer decrypts at rec_seq 1 and
+ * refuses 0.  OpenSSL does not expose the live sequence, so whoever takes over the record layer
+ * has to know where in the stream it is doing so.
  *
  * The functions are checked against values derived independently in the step 2a probe
  * (src/test/nxt_ktls_keys_test.c) rather than against published vectors - the probe's
