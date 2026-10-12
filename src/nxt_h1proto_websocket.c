@@ -794,7 +794,12 @@ nxt_h1p_conn_ws_timeout(nxt_task_t *task, void *obj, void *data)
      */
     c->socket.timedout = 0;
 
-    h1p = c->socket.data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        return;
+    }
+
     h1p->keepalive = 0;
 
     r = h1p->request;
