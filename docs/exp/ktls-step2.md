@@ -105,3 +105,25 @@ CI found two things in this increment, both worth keeping:
 Still to come in step 2: the handshake hook that fills this material at the right moment, the
 `nxt_conn_io_t` swap with `sendfile` re-enabled behind the `tls.ktls` opt-in, the cipher gate,
 close_notify, and SCM_RIGHTS.
+
+## TLS 1.2: keys proven against OpenSSL, record still refused
+
+`exp/ktls-probe/ktls_tls12_probe.py` runs a real TLS 1.2 handshake (client driven through memory
+BIOs, so the wire passes through the probe), derives the write key and IV from the master secret
+and both randoms, and **decrypts OpenSSL's own client Finished with the derived key**. That check
+passes on every run (`1400000c…`: record type, handshake length, 12 bytes of verify_data), which
+turns the TLS 1.2 PRF from "written per RFC 5246" into "checked against the peer's crypto".
+
+Two things it corrected, both from measured `EINVAL`s:
+
+  * the cipher id must match the key layout — a 32-byte key with `TLS_CIPHER_AES_GCM_128` is
+    refused, `TLS_CIPHER_AES_GCM_256` is what a SHA-384 AES-256 suite needs;
+  * these fields are host-endian: network-order packing swaps `cipher_type` and is refused.
+
+Open: with `TLS_TX` accepted and the keys verified, the kernel's records are still rejected
+(`RECORD_LAYER_FAILURE`) on all four combinations tried — the `iv` field zeroed or carrying the
+sequence, `rec_seq` 0 or 1. **For TLS 1.2, the kernel's nonce/sequence convention is not
+established.** The next experiment is to install `TLS_TX` against a plain TCP listener, dump the
+record the kernel produces, and decrypt it offline with the verified keys; the explicit-nonce field
+in that record answers the question by inspection. The probe is deliberately not in CI yet — it
+exits non-zero while the question is open.
