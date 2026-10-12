@@ -51,7 +51,7 @@ nxt_ktls_test_cmp(nxt_thread_t *thr, const char *what, const u_char *got,
 
     nxt_ktls_test_hex(expected_hex, expected, got_len);
 
-    if (nxt_memcmp(got, expected, got_len) != 0) {
+    if (memcmp(got, expected, got_len) != 0) {
         nxt_log_error(NXT_LOG_ALERT, thr->log, "kTLS keys: %s mismatch", what);
         return NXT_ERROR;
     }
