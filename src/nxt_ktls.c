@@ -105,7 +105,9 @@ nxt_ktls_try(struct tls12_crypto_info_aes_gcm_128 *info)
 
     /*
      * The TLS ULP is only accepted on an established connection.  EEXIST means a ULP is
-     * already attached, which is the state TLS_TX needs — not a failure.
+     * already attached, which is the state TLS_TX needs - not a failure.  A socket this probe
+     * created cannot answer EEXIST: it comes from a connection where OpenSSL 3.x has already
+     * attached the ULP through SSL_set_fd().
      */
     n = setsockopt(cs, IPPROTO_TCP, TCP_ULP, ulp, sizeof(ulp));
 

@@ -5,6 +5,7 @@
 
 #include <nxt_main.h>
 
+#include <openssl/crypto.h>
 #include <openssl/hmac.h>
 
 
@@ -59,21 +60,24 @@ nxt_openssl_ktls_hkdf_expand_label(const EVP_MD *md, const u_char *secret,
     size_t context_len, u_char *out, size_t out_len)
 {
     u_char      info[2 + 1 + NXT_KTLS_LABEL_MAX + 1 + 255];
-    u_char      t[NXT_KTLS_LABEL_MAX * 4], buf[EVP_MAX_MD_SIZE + sizeof(info) + 1];
+    u_char      t[EVP_MAX_MD_SIZE], buf[EVP_MAX_MD_SIZE + sizeof(info) + 1];
     size_t      hash_len, info_len, left, step, prev;
     nxt_uint_t  i, prefix_len;
+    nxt_int_t   rc;
+
+    rc = NXT_ERROR;
 
     prefix_len = nxt_strlen("tls13 ");
     i = nxt_strlen(label);
 
     if (prefix_len + i > NXT_KTLS_LABEL_MAX || context_len > 255 || out_len > 64) {
-        return NXT_ERROR;
+        goto done;
     }
 
     hash_len = EVP_MD_size(md);
 
     if (hash_len == 0 || hash_len > EVP_MAX_MD_SIZE) {
-        return NXT_ERROR;
+        goto done;
     }
 
     info[0] = (u_char) (out_len >> 8);
@@ -96,7 +100,7 @@ nxt_openssl_ktls_hkdf_expand_label(const EVP_MD *md, const u_char *secret,
 
     for (i = 1; left > 0; i++) {
         if (i > 255) {
-            return NXT_ERROR;
+            goto done;
         }
 
         nxt_memcpy(buf, t, prev);
@@ -106,7 +110,7 @@ nxt_openssl_ktls_hkdf_expand_label(const EVP_MD *md, const u_char *secret,
         if (nxt_openssl_ktls_hmac(md, secret, secret_len, buf,
                                   prev + info_len + 1, t) != NXT_OK)
         {
-            return NXT_ERROR;
+            goto done;
         }
 
         prev = hash_len;
@@ -118,7 +122,16 @@ nxt_openssl_ktls_hkdf_expand_label(const EVP_MD *md, const u_char *secret,
         left -= step;
     }
 
-    return NXT_OK;
+    rc = NXT_OK;
+
+done:
+
+    /* t and buf hold HMAC state derived from the secret; do not leave it on the stack. */
+
+    OPENSSL_cleanse(t, sizeof(t));
+    OPENSSL_cleanse(buf, sizeof(buf));
+
+    return rc;
 }
 
 
@@ -132,6 +145,9 @@ nxt_openssl_ktls_prf(const EVP_MD *md, const u_char *secret, size_t secret_len,
     u_char      buf[EVP_MAX_MD_SIZE + sizeof(ls)];
     size_t      hash_len, label_len, ls_len, left, step;
     u_char     *p;
+    nxt_int_t   rc;
+
+    rc = NXT_ERROR;
 
     hash_len = EVP_MD_size(md);
     label_len = nxt_strlen(label);
@@ -140,7 +156,7 @@ nxt_openssl_ktls_prf(const EVP_MD *md, const u_char *secret, size_t secret_len,
     if (hash_len == 0 || hash_len > EVP_MAX_MD_SIZE
         || ls_len > sizeof(ls) || hash_len + ls_len > sizeof(buf))
     {
-        return NXT_ERROR;
+        goto done;
     }
 
     /*
@@ -157,7 +173,7 @@ nxt_openssl_ktls_prf(const EVP_MD *md, const u_char *secret, size_t secret_len,
     /* A(1) = HMAC(secret, label + seed) */
 
     if (nxt_openssl_ktls_hmac(md, secret, secret_len, ls, ls_len, a) != NXT_OK) {
-        return NXT_ERROR;
+        goto done;
     }
 
     left = out_len;
@@ -171,7 +187,7 @@ nxt_openssl_ktls_prf(const EVP_MD *md, const u_char *secret, size_t secret_len,
         if (nxt_openssl_ktls_hmac(md, secret, secret_len, buf,
                                   hash_len + ls_len, a + hash_len) != NXT_OK)
         {
-            return NXT_ERROR;
+            goto done;
         }
 
         step = nxt_min(left, hash_len);
@@ -186,14 +202,24 @@ nxt_openssl_ktls_prf(const EVP_MD *md, const u_char *secret, size_t secret_len,
             if (nxt_openssl_ktls_hmac(md, secret, secret_len, a, hash_len, a + hash_len)
                 != NXT_OK)
             {
-                return NXT_ERROR;
+                goto done;
             }
 
             nxt_memcpy(a, a + hash_len, hash_len);
         }
     }
 
-    return NXT_OK;
+    rc = NXT_OK;
+
+done:
+
+    /* Every buffer here is a function of the master secret. */
+
+    OPENSSL_cleanse(a, sizeof(a));
+    OPENSSL_cleanse(ls, sizeof(ls));
+    OPENSSL_cleanse(buf, sizeof(buf));
+
+    return rc;
 }
 
 
@@ -233,9 +259,12 @@ nxt_openssl_ktls_tls12_keys(const u_char *master, size_t master_len,
     u_char        seed[64], block[80];
     size_t        block_len;
     const EVP_MD  *md;
+    nxt_int_t     rc;
+
+    rc = NXT_ERROR;
 
     if (key_len != 16 && key_len != 32) {
-        return NXT_ERROR;
+        goto done;
     }
 
     /*
@@ -245,7 +274,7 @@ nxt_openssl_ktls_tls12_keys(const u_char *master, size_t master_len,
      */
 
     if (iv_len != 4) {
-        return NXT_ERROR;
+        goto done;
     }
 
     /* key_block = PRF(master_secret, "key expansion", server_random | client_random) */
@@ -260,7 +289,7 @@ nxt_openssl_ktls_tls12_keys(const u_char *master, size_t master_len,
     if (nxt_openssl_ktls_prf(md, master, master_len, "key expansion", seed,
                              sizeof(seed), block, block_len) != NXT_OK)
     {
-        return NXT_ERROR;
+        goto done;
     }
 
     /*
@@ -272,5 +301,14 @@ nxt_openssl_ktls_tls12_keys(const u_char *master, size_t master_len,
     nxt_memcpy(key, block + (server ? key_len : 0), key_len);
     nxt_memcpy(iv, block + 2 * key_len + (server ? iv_len : 0), iv_len);
 
-    return NXT_OK;
+    rc = NXT_OK;
+
+done:
+
+    /* block is the whole key block; seed is public, but they live together. */
+
+    OPENSSL_cleanse(block, sizeof(block));
+    OPENSSL_cleanse(seed, sizeof(seed));
+
+    return rc;
 }
