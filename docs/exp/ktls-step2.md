@@ -79,3 +79,29 @@ Two changes follow from that: the probe now sets the variable the way the sendfi
 does, and `src/test/nxt_ktls_test.c` references `nxt_ktls_supported()` so that a missing file fails
 to link instead of hiding behind a green build. The test asserts nothing about the machine —
 whether a kernel offloads is the kernel's business, and the log line says which it is.
+
+## Key material (step 2, second increment)
+
+`src/nxt_openssl_ktls.c` derives what the kernel has to be told, because the kernel negotiates
+nothing: the TLS 1.3 traffic secret becomes the AES key and static IV through HKDF-Expand-Label
+(RFC 8446, section 7.3), and the TLS 1.2 master secret plus both randoms become the key block
+through the PRF (RFC 5246, sections 5 and 6.3) in its AEAD layout.
+
+`src/test/nxt_ktls_keys_test.c` checks both against values produced by the step 2a probe, whose
+HKDF-Expand-Label output the kernel and OpenSSL accepted end to end.  The record sequence is
+deliberately not derived here: 1.3 starts its application-data epoch at 0 (measured), and 1.2 has
+to be measured the same way before that path is switched on — in 1.2 the sequence is per
+connection, and the client's and the server's Finished records are sequence 0 of their own write
+keys, which is why the answer is not allowed to be assumed.
+
+CI found two things in this increment, both worth keeping:
+
+  * `nxt_memcmp` does not exist in this tree; the hardening build compiled the new source without
+    a warning and stopped at the test's call to that name (`memcmp` is what the tree uses);
+  * the PRF kept `A(i)` in `a[EVP_MAX_MD_SIZE]` and wrote its output block at `a + hash_len`, so
+    the second half of every block, 32 bytes with SHA-384, landed past the array.  macOS aborted
+    in the C tests; Linux had failed earlier and never reached the code.
+
+Still to come in step 2: the handshake hook that fills this material at the right moment, the
+`nxt_conn_io_t` swap with `sendfile` re-enabled behind the `tls.ktls` opt-in, the cipher gate,
+close_notify, and SCM_RIGHTS.
