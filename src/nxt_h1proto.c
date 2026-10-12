@@ -1783,8 +1783,20 @@ nxt_h1p_complete_buffers(nxt_task_t *task, nxt_h1proto_t *h1p, nxt_bool_t all)
 
     nxt_debug(task, "h1p complete buffers");
 
-    b = h1p->buffers;
     c = h1p->conn;
+
+    if (nxt_slow_path(c == NULL)) {
+        /*
+         * Not a h1proto of a live connection: the socket.data slot can hold
+         * a peer object, and a h1proto whose connection is gone has no buffers
+         * left to complete.  Reading c->read here is the crash this guards
+         * against: a read of nxt_conn_t.read (0x50 on LP64) with a valid
+         * object pointer and a zero conn.
+         */
+        return;
+    }
+
+    b = h1p->buffers;
     in = c->read;
 
     if (b != NULL) {
@@ -2635,7 +2647,7 @@ nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c)
 
     nxt_debug(task, "h1p shutdown");
 
-    h1p = c->socket.data;
+    h1p = nxt_h1p_from_conn(c);
 
     if (h1p != NULL) {
         nxt_h1p_complete_buffers(task, h1p, 1);

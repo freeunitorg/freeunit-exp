@@ -503,6 +503,21 @@ https://github.com/freeunitorg/freeunit/issues/688.
 </para>
 </change>
 
+
+<change type="bugfix">
+<para>
+the router could crash while it completed the buffers of a request whose
+connection was already gone.  The function that completes them reads the
+connection from the h1proto object it is given, without checking that the
+object is a h1proto of a live connection.  The socket.data slot that carries a
+h1proto is shared: the peer side of a proxied request keeps a peer object in
+it, and nxt_h1p_closing() empties the slot.  An object with a zero conn is
+therefore not a h1proto of a live connection, and it reached the read of the
+connection's input buffer as a read of address 0x50.  The completion path now
+leaves a zero connection alone, and the shutdown path reads the slot as a
+h1proto only when the object points back at the connection.
+</para>
+</change>
 </changes>
 
 

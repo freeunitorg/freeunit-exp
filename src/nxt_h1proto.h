@@ -86,6 +86,33 @@ struct nxt_h1proto_s {
     nxt_conn_t                *conn;
 };
 
+/*
+ * The h1proto object lives in the connection's socket.data, but that slot is
+ * not the h1proto's alone: the peer side of a proxied request keeps
+ * nxt_http_peer_t there, for the generic connection handlers to hand the peer
+ * to the peer handlers, and nxt_h1p_closing() empties the slot.  Every h1proto
+ * points back at the connection that owns it -- the accept path and the peer
+ * path bind them together, and the keep-alive path zeroes the h1proto up to,
+ * never including, conn.  So the object in the slot is a h1proto for this
+ * connection only when it points back at it.  Any other object is one that the
+ * caller must skip: read as a h1proto, its conn field comes from beyond that
+ * object, and the caller dereferences a zero.
+ */
+nxt_inline nxt_h1proto_t *
+nxt_h1p_from_conn(nxt_conn_t *c)
+{
+    nxt_h1proto_t  *h1p;
+
+    h1p = c->socket.data;
+
+    if (nxt_slow_path(h1p != NULL && h1p->conn != c)) {
+        return NULL;
+    }
+
+    return h1p;
+}
+
+
 #define nxt_h1p_is_http11(h1p)                                              \
     ((h1p)->parser.version.s.minor != '0')
 
