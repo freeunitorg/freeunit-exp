@@ -47,16 +47,33 @@ static nxt_int_t
 nxt_ktls_test_cmp(nxt_thread_t *thr, const char *what, const u_char *got,
     size_t got_len, const char *expected_hex)
 {
-    u_char  expected[64];
+    static const u_char  digits[] = "0123456789abcdef";
+
+    u_char   expected[64], hex[2 * 64 + 1];
+    size_t   i;
 
     nxt_ktls_test_hex(expected_hex, expected, got_len);
 
-    if (memcmp(got, expected, got_len) != 0) {
-        nxt_log_error(NXT_LOG_ALERT, thr->log, "kTLS keys: %s mismatch", what);
-        return NXT_ERROR;
+    if (memcmp(got, expected, got_len) == 0) {
+        return NXT_OK;
     }
 
-    return NXT_OK;
+    /*
+     * Reported at NOTICE and returned as an error rather than logged at ALERT: the
+     * test binary aborts on ALERT, which would hide which value disagreed.
+     */
+
+    for (i = 0; i < got_len; i++) {
+        hex[2 * i] = digits[got[i] >> 4];
+        hex[2 * i + 1] = digits[got[i] & 0xf];
+    }
+
+    hex[2 * got_len] = '\0';
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "kTLS keys: %s: got %s, expected %s",
+                  what, hex, expected_hex);
+
+    return NXT_ERROR;
 }
 
 #endif

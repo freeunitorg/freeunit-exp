@@ -123,7 +123,8 @@ nxt_openssl_ktls_prf(const EVP_MD *md, const u_char *secret, size_t secret_len,
     const char *label, const u_char *seed, size_t seed_len, u_char *out,
     size_t out_len)
 {
-    u_char      a[EVP_MAX_MD_SIZE], buf[EVP_MAX_MD_SIZE + NXT_KTLS_LABEL_MAX + 512];
+    u_char      a[EVP_MAX_MD_SIZE * 2];
+    u_char      buf[EVP_MAX_MD_SIZE + NXT_KTLS_LABEL_MAX + 512];
     size_t      hash_len, label_len, left, step;
     u_char     *p;
 
