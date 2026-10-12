@@ -107,7 +107,7 @@ nxt_int_t nxt_openssl_ktls_tls13_keys(const u_char *secret, size_t secret_len,
     nxt_bool_t sha384, u_char *key, size_t key_len, u_char *iv);
 nxt_int_t nxt_openssl_ktls_tls12_keys(const u_char *master, size_t master_len,
     const u_char *client_random, const u_char *server_random, nxt_bool_t sha384,
-    u_char *key, size_t key_len, u_char *iv);
+    nxt_bool_t server, size_t iv_len, u_char *key, size_t key_len, u_char *iv);
 
 #if (NXT_TESTS)
 /*

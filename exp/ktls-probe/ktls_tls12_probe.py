@@ -138,18 +138,20 @@ def set_ulp(sock):
         raise
 
 
-def install_tx(sock, key, iv, seq, prefix, cipher_id=TLS_CIPHER_AES_GCM_128):
-    """struct tls12_crypto_info_aes_gcm_128: version, cipher, iv[8], key[16], salt[4], rec_seq[8].
+def install_tx(sock, key, salt, explicit, seq, prefix, cipher_id=TLS_CIPHER_AES_GCM_128):
+    """struct tls12_crypto_info_aes_gcm_{128,256}: info, iv[8], key[], salt[4], rec_seq[8].
 
-    Native byte order: the kernel reads these fields as host-endian, and packing them network
-    order swaps cipher_type into something it does not know, which it answers with EINVAL.
+    salt is the derived fixed IV (the first four bytes of the GCM nonce) and explicit is the
+    initial 8-byte explicit nonce; the nonce per record is salt || explicit.  The first version
+    of this probe passed the explicit nonce where the salt belongs and hardcoded zeros in the
+    salt slot, so the kernel encrypted with salt 00000000 and no peer could authenticate a
+    record - the four failures that followed were the probe's, not the kernel's.
+
+    version and cipher_type are host-endian; rec_seq is consumed as the eight bytes of the
+    record sequence in the AAD, so it is network order.
     """
-    if len(key) == 32:
-        info = struct.pack("HH8s32s4s8s", prefix, cipher_id, b"\x00" * 8, key, iv,
-                           struct.pack("Q", seq))
-    else:
-        info = struct.pack("HH8s16s4s8s", prefix, cipher_id, b"\x00" * 8, key, iv,
-                           struct.pack("Q", seq))
+    info = struct.pack("HH8s%ds4s8s" % len(key), prefix, cipher_id, explicit, key, salt,
+                       struct.pack(">Q", seq))
 
     sock.setsockopt(SOL_TLS, TLS_TX, info)
 
@@ -311,7 +313,7 @@ def attempt(port_no, seq, keylog_path, prefix, payload, iv_mode="zero"):
                 "cipher": cipher, "key_len": len(key)}
 
     try:
-        install_tx(sock, key, iv_field, seq, prefix, cipher_id)
+        install_tx(sock, key, iv, iv_field, seq, prefix, cipher_id)
         trace["install"] = f"accepted (cipher {cipher_id})"
     except OSError as e:
         trace["install"] = f"errno {e.errno} {e.strerror}"

@@ -10,11 +10,18 @@
 /*
  * Checks the key derivation the kTLS data path will depend on (src/nxt_openssl_ktls.c).
  *
- * The expected values were produced by the step 2a probe's Python derivation -
- * exp/ktls-probe/ktls_keys_probe.py - whose HKDF-Expand-Label and PRF output the kernel and
- * OpenSSL have already accepted end to end on CI (a kernel that took those keys produced
- * records the peer's OpenSSL decrypted).  So this is a cross-check against an implementation
- * that has been validated against something real, not against a remembered constant.
+ * Where the expected values come from, per side, because they are not equally strong evidence:
+ *
+ *   * TLS 1.3: the step 2a probe's HKDF-Expand-Label output, which the kernel and OpenSSL
+ *     accepted end to end on CI (a kernel that took those keys produced records the peer's
+ *     OpenSSL decrypted);
+ *   * TLS 1.2: OpenSSL's own TLS1-PRF, independent of this code -
+ *     `openssl kdf -keylen 72 -kdfopt digest:SHA384 -kdfopt hexsecret:<master>
+ *      -kdfopt seed:"key expansion" -kdfopt hexseed:<server_random><client_random> TLS1-PRF`.
+ *     The first version of these vectors came from a Python PRF that left the label out of
+ *     A(0) exactly as the C did, so the test agreed with the bug and CI stayed green.
+ * Neither side is a remembered constant: the 1.3 values are key material a real kernel used
+ * and a real peer decrypted, and the 1.2 values are OpenSSL's own PRF over the same inputs.
  *
  * The inputs are synthetic on purpose: a secret of 0x00..0x1f, a master secret of 0x00..0x2f,
  * client random 0x00..0x1f, server random 0x20..0x3f.  What is being checked is the
@@ -120,31 +127,50 @@ nxt_ktls_keys_test(nxt_thread_t *thr)
         return NXT_ERROR;
     }
 
-    /* TLS 1.2, AES-128-GCM-SHA256 */
+    /* TLS 1.2, AES-128-GCM-SHA256: the client pair, then the server pair */
 
-    if (nxt_openssl_ktls_tls12_keys(master, 48, cr, sr, 0, key, 16, iv) != NXT_OK
-        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-256 key", key, 16,
-                             "23a44f6bbe6b9f1947cb08ef8ef0efdf") != NXT_OK
-        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-256 iv", iv, 4,
-                             "630b36e5") != NXT_OK)
+    if (nxt_openssl_ktls_tls12_keys(master, 48, cr, sr, 0, 0, 4, key, 16, iv) != NXT_OK
+        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-256 client key", key, 16,
+                             "fbe0dbb71e9097fcfe644317a16d334f") != NXT_OK
+        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-256 client iv", iv, 4,
+                             "48092b65") != NXT_OK
+        || nxt_openssl_ktls_tls12_keys(master, 48, cr, sr, 0, 1, 4, key, 16, iv) != NXT_OK
+        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-256 server key", key, 16,
+                             "ac721a5f822730468a366a4ef2f22068") != NXT_OK
+        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-256 server iv", iv, 4,
+                             "ca8b00c3") != NXT_OK)
     {
         return NXT_ERROR;
     }
 
     /* TLS 1.2, AES-256-GCM-SHA384 */
 
-    if (nxt_openssl_ktls_tls12_keys(master, 48, cr, sr, 1, key, 32, iv) != NXT_OK
-        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-384 key", key, 32,
-                             "e6fa1e701042ca9ee33a9159930b6471"
-                             "a374999cf2129b377fd31c0bd37ce169") != NXT_OK
-        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-384 iv", iv, 4,
-                             "e21424ad") != NXT_OK)
+    if (nxt_openssl_ktls_tls12_keys(master, 48, cr, sr, 1, 0, 4, key, 32, iv) != NXT_OK
+        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-384 client key", key, 32,
+                             "de545e3a55fc37510a2c9f4823c15511"
+                             "bc0497d6e1245e15574209a947c08351") != NXT_OK
+        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-384 client iv", iv, 4,
+                             "c241a06d") != NXT_OK
+        || nxt_openssl_ktls_tls12_keys(master, 48, cr, sr, 1, 1, 4, key, 32, iv) != NXT_OK
+        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-384 server key", key, 32,
+                             "0cdaf95bc7a2a184989c633771e022fa"
+                             "683a0c6e362a908f7da3715ca40516a3") != NXT_OK
+        || nxt_ktls_test_cmp(thr, "TLS 1.2 SHA-384 server iv", iv, 4,
+                             "a740d7a5") != NXT_OK)
     {
         return NXT_ERROR;
     }
 
+    /* The layout this function does not handle must be refused, not answered wrongly */
+
+    if (nxt_openssl_ktls_tls12_keys(master, 48, cr, sr, 0, 0, 12, key, 16, iv) == NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "kTLS keys: a 12-byte start IV (RFC 7905 layout) was accepted");
+        return NXT_ERROR;
+    }
+
     nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                  "kTLS keys: TLS 1.3 and TLS 1.2 derivations match the probe");
+                  "kTLS keys: 1.3 matches the probe, 1.2 matches OpenSSL's TLS1-PRF");
 
     return NXT_OK;
 

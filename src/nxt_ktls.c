@@ -4,16 +4,16 @@
  * Copyright (C) NGINX, Inc.
  */
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <linux/tls.h>
-
 #include <nxt_main.h>
 #include "nxt_ktls.h"
 
 
 #if (NXT_HAVE_KTLS)
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <linux/tls.h>
 
 
 /*
@@ -33,7 +33,14 @@
  * application-data sequence of a TLS 1.3 connection starts at 0.
  */
 
-static nxt_int_t  nxt_ktls_probe = -1;   /* -1: not probed; NXT_OK or NXT_ERROR after */
+/*
+ * NXT_ERROR is -1, so a sentinel of -1 would be indistinguishable from "the probe failed":
+ * the verdict would never be cached and every call would build four sockets and a loopback
+ * connection to learn the same thing again.  Hence a separate flag.
+ */
+
+static nxt_int_t   nxt_ktls_probe;
+static nxt_bool_t  nxt_ktls_probed;
 
 
 static nxt_int_t
@@ -138,7 +145,7 @@ nxt_ktls_supported(nxt_task_t *task)
 {
     struct tls12_crypto_info_aes_gcm_128  info;
 
-    if (nxt_ktls_probe != -1) {
+    if (nxt_ktls_probed) {
         return nxt_ktls_probe;
     }
 
@@ -148,6 +155,7 @@ nxt_ktls_supported(nxt_task_t *task)
     info.info.cipher_type = TLS_CIPHER_AES_GCM_128;
 
     nxt_ktls_probe = nxt_ktls_try(&info);
+    nxt_ktls_probed = 1;
 
     if (task != NULL) {
         nxt_log_debug(task->log, "kTLS: %s",

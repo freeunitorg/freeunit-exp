@@ -124,24 +124,35 @@ nxt_openssl_ktls_prf(const EVP_MD *md, const u_char *secret, size_t secret_len,
     size_t out_len)
 {
     u_char      a[EVP_MAX_MD_SIZE * 2];
-    u_char      buf[EVP_MAX_MD_SIZE + NXT_KTLS_LABEL_MAX + 512];
-    size_t      hash_len, label_len, left, step;
+    u_char      ls[NXT_KTLS_LABEL_MAX + 512];
+    u_char      buf[EVP_MAX_MD_SIZE + sizeof(ls)];
+    size_t      hash_len, label_len, ls_len, left, step;
     u_char     *p;
 
     hash_len = EVP_MD_size(md);
     label_len = nxt_strlen(label);
+    ls_len = label_len + seed_len;
 
     if (hash_len == 0 || hash_len > EVP_MAX_MD_SIZE
-        || hash_len + label_len + seed_len > sizeof(buf))
+        || ls_len > sizeof(ls) || hash_len + ls_len > sizeof(buf))
     {
         return NXT_ERROR;
     }
 
-    /* A(1) = HMAC(secret, seed), then A(i) = HMAC(secret, A(i-1)). */
+    /*
+     * RFC 5246 section 5: PRF(secret, label, seed) = P_hash(secret, label + seed), and
+     * P_hash runs A(0) = label + seed, A(i) = HMAC(secret, A(i-1)), with every output block
+     * HMAC(secret, A(i) + label + seed).  Leaving the label out of A(0) - which this function
+     * did at first - gives different keys for every byte while still looking like a PRF; the
+     * test vectors agreed with it because they were generated the same way.
+     */
 
-    if (nxt_openssl_ktls_hmac(md, secret, secret_len, seed, seed_len, a)
-        != NXT_OK)
-    {
+    nxt_memcpy(ls, label, label_len);
+    nxt_memcpy(ls + label_len, seed, seed_len);
+
+    /* A(1) = HMAC(secret, label + seed) */
+
+    if (nxt_openssl_ktls_hmac(md, secret, secret_len, ls, ls_len, a) != NXT_OK) {
         return NXT_ERROR;
     }
 
@@ -149,13 +160,12 @@ nxt_openssl_ktls_prf(const EVP_MD *md, const u_char *secret, size_t secret_len,
 
     while (left > 0) {
         p = nxt_cpymem(buf, a, hash_len);
-        p = nxt_cpymem(p, label, label_len);
-        p = nxt_cpymem(p, seed, seed_len);
+        nxt_memcpy(p, ls, ls_len);
 
         /* out += HMAC(secret, A(i) + label + seed) */
 
         if (nxt_openssl_ktls_hmac(md, secret, secret_len, buf,
-                                  (size_t) (p - buf), a + hash_len) != NXT_OK)
+                                  hash_len + ls_len, a + hash_len) != NXT_OK)
         {
             return NXT_ERROR;
         }
@@ -214,7 +224,7 @@ nxt_openssl_ktls_tls13_keys(const u_char *secret, size_t secret_len,
 nxt_int_t
 nxt_openssl_ktls_tls12_keys(const u_char *master, size_t master_len,
     const u_char *client_random, const u_char *server_random, nxt_bool_t sha384,
-    u_char *key, size_t key_len, u_char *iv)
+    nxt_bool_t server, size_t iv_len, u_char *key, size_t key_len, u_char *iv)
 {
     u_char        seed[64], block[80];
     size_t        block_len;
@@ -224,12 +234,22 @@ nxt_openssl_ktls_tls12_keys(const u_char *master, size_t master_len,
         return NXT_ERROR;
     }
 
+    /*
+     * The key block layout here is the AEAD one, where the fixed IV is four bytes.  TLS 1.2
+     * ChaCha20-Poly1305 (RFC 7905) fixes twelve, and its block is laid out differently: reject
+     * it rather than hand back an IV cut from the wrong offset.
+     */
+
+    if (iv_len != 4) {
+        return NXT_ERROR;
+    }
+
     /* key_block = PRF(master_secret, "key expansion", server_random | client_random) */
 
     nxt_memcpy(seed, server_random, 32);
     nxt_memcpy(seed + 32, client_random, 32);
 
-    block_len = 2 * key_len + 8;   /* two write keys and two four-byte write IVs */
+    block_len = 2 * key_len + 2 * iv_len;
 
     md = sha384 ? EVP_sha384() : EVP_sha256();
 
@@ -239,10 +259,14 @@ nxt_openssl_ktls_tls12_keys(const u_char *master, size_t master_len,
         return NXT_ERROR;
     }
 
-    /* The AEAD key block: client_write_key, server_write_key, then both write IVs. */
+    /*
+     * The AEAD key block: client_write_key, server_write_key, then client_write_IV and
+     * server_write_IV.  The caller says which side it is: Unit is the server, so its TLS_TX
+     * needs the server pair while a client's records arrive under the client pair.
+     */
 
-    nxt_memcpy(key, block, key_len);
-    nxt_memcpy(iv, block + 2 * key_len, 4);
+    nxt_memcpy(key, block + (server ? key_len : 0), key_len);
+    nxt_memcpy(iv, block + 2 * key_len + (server ? iv_len : 0), iv_len);
 
     return NXT_OK;
 }
