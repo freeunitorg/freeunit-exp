@@ -253,11 +253,11 @@ static void nxt_http_static_buf_completion(nxt_task_t *task, void *obj,
 static void nxt_http_static_buf_cleanup(nxt_task_t *task, void *obj,
     void *data);
 
-static void nxt_http_static_ktls_body_handler(nxt_task_t *task, void *obj,
+static void nxt_http_static_file_body_handler(nxt_task_t *task, void *obj,
     void *data);
-static void nxt_http_static_ktls_completion(nxt_task_t *task, void *obj,
+static void nxt_http_static_file_completion(nxt_task_t *task, void *obj,
     void *data);
-static nxt_bool_t nxt_http_static_ktls_sendfile(nxt_http_request_t *r);
+static nxt_bool_t nxt_http_static_sendfile(nxt_http_request_t *r);
 
 static nxt_int_t nxt_http_static_mtypes_hash_test(nxt_lvlhsh_query_t *lhq,
     void *data);
@@ -1238,14 +1238,15 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             }
 
             /*
-             * When the connection is using kernel TLS the file goes to the
-             * write path as a file buffer and the TLS sendbuf sends it with
-             * SSL_sendfile(): the payload moves from the file into the socket
-             * in the kernel, without the two 128 KiB copies the memory path
-             * below makes.  Any other connection keeps the memory path.
+             * When the connection can send a file buffer, the file goes to the
+             * write path as one and the payload moves from the file into the
+             * socket without the two 128 KiB copies the memory path below
+             * makes: with sendfile() on a plain connection, with SSL_sendfile()
+             * on a connection whose kernel TLS is active.  Every other case
+             * keeps the memory path.
              */
-            if (nxt_http_static_ktls_sendfile(r)) {
-                body_handler = &nxt_http_static_ktls_body_handler;
+            if (nxt_http_static_sendfile(r)) {
+                body_handler = &nxt_http_static_file_body_handler;
 
             } else {
                 body_handler = &nxt_http_static_body_handler;
@@ -1962,23 +1963,40 @@ extension:
 
 
 /*
- * Whether this request's connection can send a file without reading it into
- * memory, that is, whether it is HTTP/1 with kernel TLS active.  Checked once
- * per response, before a file buffer is handed over.
+ * Whether this request's response body can go to the write path as a file
+ * buffer: HTTP/1 on a plain connection, or HTTP/1 on a TLS connection whose
+ * kernel TLS is active.  Checked once per response, before a file buffer is
+ * handed over.
  */
 
 static nxt_bool_t
-nxt_http_static_ktls_sendfile(nxt_http_request_t *r)
+nxt_http_static_sendfile(nxt_http_request_t *r)
 {
 #if (NXT_TLS)
     nxt_conn_t  *c;
+#endif
 
     if (r->protocol != NXT_HTTP_PROTO_H1) {
         return 0;
     }
 
+    if (!r->tls) {
+        /*
+         * A plain connection always can: nxt_conn_io_sendbuf() hands a buffer
+         * that holds only a file to nxt_conn_io_sendfile(), which is sendfile()
+         * or its platform equivalent.
+         */
+        return 1;
+    }
+
+#if (NXT_TLS)
     c = r->proto.h1->conn;
 
+    /*
+     * With TLS the file only saves the copies when the record encryption is in
+     * the kernel as well, otherwise the payload returns to user space for
+     * SSL_write() and the file buffer buys nothing.
+     */
     return (c->io->sendfile_ready != NULL)
            && c->io->sendfile_ready(c);
 #else
@@ -1994,7 +2012,7 @@ nxt_http_static_ktls_sendfile(nxt_http_request_t *r)
  */
 
 static void
-nxt_http_static_ktls_body_handler(nxt_task_t *task, void *obj, void *data)
+nxt_http_static_file_body_handler(nxt_task_t *task, void *obj, void *data)
 {
     nxt_buf_t           *fb;
     nxt_http_request_t  *r;
@@ -2002,7 +2020,7 @@ nxt_http_static_ktls_body_handler(nxt_task_t *task, void *obj, void *data)
     r = obj;
     fb = r->out;
 
-    nxt_debug(task, "http static ktls body fd:%d", fb->file->fd);
+    nxt_debug(task, "http static file body fd:%d", fb->file->fd);
 
     /*
      * The buffer has carried only bookkeeping until now: nxt_buf_is_file() is
@@ -2012,9 +2030,16 @@ nxt_http_static_ktls_body_handler(nxt_task_t *task, void *obj, void *data)
      */
     nxt_buf_set_file(fb);
 
-    fb->completion_handler = nxt_http_static_ktls_completion;
+    fb->completion_handler = nxt_http_static_file_completion;
     fb->parent = r;
     fb->next = nxt_http_buf_last(r);
+
+    /*
+     * The completion handler reads r->out when the buffer has been sent or
+     * discarded, and that can happen after the request itself is done.  The
+     * memory path holds the pool for each of its buffers for the same reason.
+     */
+    nxt_mp_retain(r->mem_pool);
 
     nxt_http_request_send(task, r, fb);
 }
@@ -2027,7 +2052,7 @@ nxt_http_static_ktls_body_handler(nxt_task_t *task, void *obj, void *data)
  */
 
 static void
-nxt_http_static_ktls_completion(nxt_task_t *task, void *obj, void *data)
+nxt_http_static_file_completion(nxt_task_t *task, void *obj, void *data)
 {
     nxt_buf_t           *fb;
     nxt_http_request_t  *r;
@@ -2035,7 +2060,7 @@ nxt_http_static_ktls_completion(nxt_task_t *task, void *obj, void *data)
     fb = obj;
     r = data;
 
-    nxt_debug(task, "http static ktls completion fd:%d pos:%O end:%O",
+    nxt_debug(task, "http static file completion fd:%d pos:%O end:%O",
               fb->file->fd, fb->file_pos, fb->file_end);
 
     nxt_file_close(task, fb->file);
@@ -2045,6 +2070,8 @@ nxt_http_static_ktls_completion(nxt_task_t *task, void *obj, void *data)
     }
 
     nxt_http_static_buf_free(fb);
+
+    nxt_mp_release(r->mem_pool);
 }
 
 
