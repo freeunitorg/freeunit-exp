@@ -481,6 +481,9 @@ void     nxt_unit_test_ctx_detached_start(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_detached_done(nxt_unit_ctx_t *ctx);
 int      nxt_unit_test_ctx_detached_retry(nxt_unit_ctx_t *ctx);
 nxt_unit_port_t  *nxt_unit_test_ctx_read_port(nxt_unit_ctx_t *ctx);
+void     *nxt_unit_test_port_queue(nxt_unit_port_t *port);
+int      nxt_unit_test_wait_shm_ack(nxt_unit_ctx_t *ctx, size_t *held);
+size_t   nxt_unit_test_parked_rbufs(nxt_unit_ctx_t *ctx);
 uint64_t nxt_unit_test_detached_now(void);
 uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);
 uint8_t  nxt_unit_test_ctx_ready(nxt_unit_ctx_t *ctx);
@@ -488,6 +491,8 @@ void     nxt_unit_test_ctx_set_ready(nxt_unit_ctx_t *ctx, uint8_t val);
 void     nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx);
 int      nxt_unit_test_add_queue_port(nxt_unit_ctx_t *ctx, pid_t pid,
     uint16_t id, int out_fd, void *queue);
+void     nxt_unit_test_new_mmap_failures(unsigned int failures);
+void     nxt_unit_test_shm_probe_failures(unsigned int failures);
 #endif
 
 #if (NXT_TESTS || NXT_FUZZ_BUILD)

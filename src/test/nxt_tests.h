@@ -112,6 +112,7 @@ nxt_int_t nxt_port_ctrunc_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_rpc_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_queued_fd_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_share_test(nxt_thread_t *thr);
 nxt_int_t nxt_checked_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_close_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
@@ -123,6 +124,7 @@ nxt_int_t nxt_size_bound_test(nxt_thread_t *thr);
 nxt_int_t nxt_regex_test(nxt_thread_t *thr);
 #endif
 nxt_int_t nxt_openssl_server_init_test(nxt_thread_t *thr);
+nxt_int_t nxt_openssl_log_level_test(nxt_thread_t *thr);
 nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_controller_peer_test(nxt_thread_t *thr);
 nxt_int_t nxt_cpu_limit_test(nxt_thread_t *thr);

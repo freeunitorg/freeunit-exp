@@ -12,6 +12,51 @@
 
 <change type="bugfix">
 <para>
+the control API accepted a compression "level" out of the range of an
+integer, such as 2147483648.  The router then did not apply the "compression"
+block, and compression was off for the whole configuration.  Such a number is
+now refused.  A stored configuration with it still loads, with a warning, and
+compression stays off.  The control API refuses other updates until the
+"level" is corrected.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when the port queue of an application was full, the router closed a websocket
+connection with no CLOSE frame.  A full queue means that the application reads
+slower than the client sends, for example a message of many small frames.  The
+router now stops reading from the client and sends the frame again every 5 ms.
+When the application reads nothing for the websocket "read_timeout", the router
+closes the connection, as before.  The message that tells the application about
+the close was lost on a full queue, so the worker did not stop; it is now sent
+again until the queue takes it.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on Linux with a 32-bit glibc, several source files had a 32-bit off_t, and the
+other files had a 64-bit off_t.  The files include a system header before
+nxt_unix.h, which sets _FILE_OFFSET_BITS: nxt_http_compression.c, nxt_zlib.c,
+nxt_brotli.c, nxt_zstd.c, nxt_upstream_round_robin.c and four libunit test
+programs.  A struct with an off_t then had different layouts in different
+files.  The "min_length" compression option was written as 8 bytes into a
+4-byte field, and build/tests crashed.  configure now adds
+-D_FILE_OFFSET_BITS=64 on Linux, and the build fails when off_t does not have
+the size that configure measured.  musl and 64-bit systems were not affected.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the record that the cgroup CPU limit lowers the CPU count went only to stderr,
+before the log file was open.  It is now written to the log file.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 with a 32-bit size_t, the memory pool did not check the sum of a large size,
 its alignment and its block header.  An allocation of 4294967269 to 4294967294
 bytes got a block of 0 to 24 bytes.  The buffer allocators added their header
@@ -33,49 +78,71 @@ segment it already had, and it replayed the frames it kept aside in reverse.
 A fragmented message could reach the application short, and the connection
 could then close with a protocol error.  Whole messages could swap.  This
 needed a client that sent faster than the application read.  The bug had
-appeared in 1.19.0.  The fix is in libunit.  Node.js and Python ASGI
-applications get it.  A Node.js application gets it when it is built with
+appeared in 1.19.0.  The fix is in libunit.  Node.js, Python ASGI and Java
+websocket applications get it; a Node.js application needs a rebuild against
 the new libunit.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-on 32-bit platforms, the "min_length" option of a compressor did not work.  On
-little-endian platforms, such as x86, armv7 and armhf, a response shorter than
-"min_length" was compressed, and a client that refused identity got the
-compressed response instead of a 406.  On big-endian platforms, a compressor
-with "min_length" compressed no response shorter than 4 GiB.  The bug had
-appeared in 1.35.0.
+when libunit grew its array of shared memory segments, the lists of read
+buffers that waited for a segment still pointed into the old array.  libunit
+could then write into freed memory and not ask for a segment.  The bug had
+appeared in 1.19.0.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-the control API accepted a listener with neither "pass" nor "application",
-and the router then refused the configuration with 500.
+when libunit freed a context, the read buffers that waited for a shared memory
+segment, or behind such a buffer, leaked with the descriptors of their
+messages.  In an application with more than one thread, another thread could
+then use the freed context, and the application could crash.  The bug had
+appeared in 1.19.0.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-on macOS with 16 KiB pages, every request to an application failed with
-"incoming_mmap: unexpected segment size".
+the control API accepted a listener with neither "pass" nor "application".  The
+router then refused the configuration, and the client got 500 "Failed to apply
+new configuration."  with only "failed to apply new conf" in the log.  The
+control API now answers 400 and names the listener.  The router log also names
+it.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on macOS with 16 KiB pages, every request to an application failed.  The
+application logged "incoming_mmap: unexpected segment size: 10502144 !=
+10489856" and exited.  macOS rounds a shared memory segment up to a whole page,
+and 1.37.0 required the exact size.  A larger segment is now accepted.  A
+shorter one is still refused.  The check in the application appeared in 1.37.0.
+The same check in the router appeared in 1.36.1 and dropped larger application
+responses on macOS.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
 with OpenTelemetry, the inbound "traceparent" was ignored when the request
-header arrived in more than one read; the span of a request that fails before
-it is complete had no request attributes.
+header arrived in more than one read.  The span started after the first read,
+before the header was parsed, so it got a new trace ID.  The span now starts
+after the whole header is parsed, with the arrival of the request as its start
+time.  The span of a request that fails before it is complete, such as a 400 or
+a 408, now has the request attributes.  The bug had appeared in 1.34.0.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
 with "chunked_transform", a valid chunked request body got 400 when a read
-ended right after the data of a chunk, before the CRLF after it.
+ended right after the data of a chunk, before the CRLF after it.  The data
+stayed in the read buffer, and the next read was parsed after it.  So the
+result depended on how the client's writes reached the server.  The bug had
+appeared in 1.35.5.
 </para>
 </change>
 
@@ -85,7 +152,8 @@ unitd did not load the stored configuration when the "version" file in the
 state directory ended with a line end, as "echo 13700 > version" and most
 editors write it.  It logged "invalid version string" and started with no
 configuration.  A line end, a space or a tab after the number is now ignored.
-Any other content is still an error.  The bug had appeared in 1.26.0.
+Any other content is still an error.  unitd itself writes the file with no line
+end.  The bug had appeared in 1.26.0.
 </para>
 </change>
 
@@ -156,12 +224,15 @@ request.  The bug had appeared in 1.16.0.
 <change type="bugfix">
 <para>
 the control API accepted any integer for the timeouts in "settings/http", in
-"settings/http/websocket" and for "timeout" in "limits" of an application.
-They are now refused out of the range 0 to 2147483 seconds.  A stored
-configuration with such a value still loads, with a warning.  Numbers out of
-the range of an integer option now fail the configuration instead of giving
-an undefined value.  "requests" in "limits" and "thread_stack_size" are now
-refused above 2147483647, and "requests" below 0.
+"settings/http/websocket" and for "timeout" in "limits" of an application.  A
+negative timeout had no defined value.  A timeout above 2147483 seconds fired
+at once.  They are now refused out of the range 0 to 2147483 seconds, as
+"start_timeout" is.  A stored configuration with such a value still loads, with
+a warning, and the timer fires at once, as a negative value did before on x86.
+Numbers out of the range of an integer option now fail the configuration
+instead of giving an undefined value.  "requests" in "limits" and
+"thread_stack_size" are now refused above 2147483647, and "requests" below 0.
+See https://github.com/freeunitorg/freeunit/issues/619.
 </para>
 </change>
 
@@ -177,9 +248,24 @@ clang were not affected.  The bug had appeared in 1.36.0.
 <change type="bugfix">
 <para>
 an application worker whose WHOAMI the main process refused was not told so.
-It waited for ever and stayed alive until its prototype quit.  On Linux, the
-worker now logs "WHOAMI failed, exiting" and exits, and main logs the reason.
-On other platforms a refused worker still waits, as before.
+It waited for a reply for ever and stayed alive until its prototype quit.  This
+happens when a host pid is reused while main still has the record of the old
+worker.  On Linux, main now answers a refused WHOAMI with an error, and also
+when it cannot send the reply to an accepted one.  The worker logs "WHOAMI
+failed, exiting" and exits, and main logs the reason.  On other platforms a
+refused worker still waits, as before.  Main also refuses a WHOAMI for a record
+that is still linked to a prototype.  The bug had appeared in 1.37.0.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on 32-bit platforms, the "min_length" option of a compressor did not work.  On
+little-endian platforms, such as x86, armv7 and armhf, a response shorter than
+"min_length" was compressed, and a client that refused identity got the
+compressed response instead of a 406.  On big-endian platforms, a compressor
+with "min_length" compressed no response shorter than 4 GiB.  The bug had
+appeared in 1.35.0.
 </para>
 </change>
 
@@ -192,6 +278,58 @@ used only its low byte: 265 became 9, with no notice.  The bug had appeared in
 1.35.0.
 </para>
 </change>
+
+<change type="change">
+<para>
+a TLS connection that fails because of what the client sent is now logged at
+"info" instead of "alert".  This covers an old protocol version, an unsupported
+key share or signature algorithm, a TLS 1.3 key share without the supported
+groups extension, a TLS 1.3 resumption with a binder that does not verify, and
+most alerts from the client.
+</para>
+</change>
+
+<change type="change">
+<para>
+libunit sends the response of a request through the shared memory queue of the
+router port again.  To keep the messages of a request in order, 1.37.0 sent all
+of them to the socket, except the last one; for a small PHP response that cost
+two more datagrams and 13.7% more instructions per request in the server.  Now
+a response moves to the queue with its first message that fits there, and its
+later messages follow it there.  Response data over 15 bytes now goes into
+shared memory also below 1024 bytes; when no chunk is free, a small write uses
+plain memory and the socket, as before.  A websocket keeps the path of 1.37.0.
+An application of type "external", such as Go or Node.js, gets the change when
+it is built with the new libunit.  A response that moves from the queue to the
+socket first waits up to 1 second for the router to take its queue messages;
+if the router does not take them, the request ends with a 503, or with a
+truncated response if the header was already sent.
+</para>
+</change>
+
+<change type="change">
+<para>
+the Wasmtime library of the wasm module is now built without the
+component-model C API.  The module loads core WebAssembly modules only and
+never called that API.  libwasmtime.so shrinks from 32.4 MB to 23.6 MB and no
+longer exports the 156 wasmtime_component_* functions, the
+wasmtime_config_wasm_component_model_* options and the six
+wasmtime_module_type_* functions: clone, delete, import_count, import_nth,
+export_count and export_nth.  The packages install libwasmtime.so in the
+system library directory.  A program other than FreeUnit that links that file
+and calls the component API no longer loads.  The wasm-wasi-component module
+is not affected.
+</para>
+</change>
+<change type="bugfix">
+<para>
+a PUT of an application configuration bigger than about 64 KiB never got an
+answer, and later control requests hung too.  The router sent the first 64 KiB
+of the message to main and queued the rest, but did not ask to be woken up to
+send it.  The bug came from NGINX Unit.
+</para>
+</change>
+
 
 </changes>
 
