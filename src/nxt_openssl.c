@@ -275,6 +275,23 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
 #endif
 
+    if (tls_init->ktls) {
+#ifdef SSL_OP_ENABLE_KTLS
+        /*
+         * OpenSSL moves record encryption to the kernel after the handshake
+         * when the kernel "tls" module and the negotiated cipher allow it.
+         * Otherwise the connection silently stays in user space.
+         */
+        SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+#else
+        /* server_init() runs once per certificate, "last" is set once. */
+        if (last) {
+            nxt_log(task, NXT_LOG_WARN, "\"ktls\" is not supported by "
+                    "this OpenSSL build, TLS stays in user space");
+        }
+#endif
+    }
+
 #ifdef SSL_MODE_RELEASE_BUFFERS
 
     if (nxt_openssl_version >= 10001078) {
@@ -1313,6 +1330,15 @@ nxt_openssl_conn_handshake(nxt_task_t *task, void *obj, void *data)
     if (ret > 0) {
         /* ret == 1, the handshake was successfully completed. */
         tls->handshake = 1;
+
+#if (NXT_DEBUG) && defined(SSL_OP_ENABLE_KTLS) && defined(BIO_get_ktls_send)
+        if (SSL_get_options(tls->session) & SSL_OP_ENABLE_KTLS) {
+            nxt_debug(task, "openssl conn fd:%d ktls send:%d recv:%d",
+                      c->socket.fd,
+                      (int) BIO_get_ktls_send(SSL_get_wbio(tls->session)),
+                      (int) BIO_get_ktls_recv(SSL_get_rbio(tls->session)));
+        }
+#endif
 
         if (c->read_state != NULL) {
             if (state->io_read_handler != NULL || c->read != NULL) {
