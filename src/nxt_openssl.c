@@ -18,6 +18,17 @@
 #include <openssl/evp.h>
 
 /*
+ * SSL_sendfile() and the kernel TLS BIO flag arrived with OpenSSL 3.0.  When
+ * either is missing, a file buffer on a TLS connection cannot be sent without
+ * reading it into memory, and nxt_openssl_conn_sendfile_ready() says so.
+ */
+#if defined(SSL_OP_ENABLE_KTLS) && defined(BIO_get_ktls_send)
+#define NXT_OPENSSL_KTLS_SENDFILE  1
+#else
+#define NXT_OPENSSL_KTLS_SENDFILE  0
+#endif
+
+/*
  * The X509 name accessors were constified in stages, and not together:
  * X509_NAME_get_entry() and X509_NAME_ENTRY_get_data() took const arguments
  * from 1.1.0, but X509_NAME_get_index_by_NID() only from 3.0, and it is 4.0
@@ -139,6 +150,9 @@ static void nxt_openssl_conn_init(nxt_task_t *task, nxt_tls_conf_t *conf,
 static void nxt_openssl_conn_handshake(nxt_task_t *task, void *obj, void *data);
 static ssize_t nxt_openssl_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b);
 static ssize_t nxt_openssl_conn_io_sendbuf(nxt_task_t *task, nxt_sendbuf_t *sb);
+static ssize_t nxt_openssl_conn_io_sendfile(nxt_task_t *task,
+    nxt_sendbuf_t *sb);
+static nxt_bool_t nxt_openssl_conn_sendfile_ready(nxt_conn_t *c);
 static ssize_t nxt_openssl_conn_io_send(nxt_task_t *task, nxt_sendbuf_t *sb,
     void *buf, size_t size);
 static void nxt_openssl_conn_io_shutdown(nxt_task_t *task, void *obj,
@@ -172,6 +186,7 @@ static nxt_conn_io_t  nxt_openssl_conn_io = {
 
     .write = nxt_conn_io_write,
     .sendbuf = nxt_openssl_conn_io_sendbuf,
+    .sendfile_ready = nxt_openssl_conn_sendfile_ready,
 
     .shutdown = nxt_openssl_conn_io_shutdown,
 };
@@ -274,6 +289,23 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     /* Request SSL_ERROR_ZERO_RETURN on EOF. */
     SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
 #endif
+
+    if (tls_init->ktls) {
+#ifdef SSL_OP_ENABLE_KTLS
+        /*
+         * OpenSSL moves record encryption to the kernel after the handshake
+         * when the kernel "tls" module and the negotiated cipher allow it.
+         * Otherwise the connection silently stays in user space.
+         */
+        SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+#else
+        /* server_init() runs once per certificate, "last" is set once. */
+        if (last) {
+            nxt_log(task, NXT_LOG_WARN, "\"ktls\" is not supported by "
+                    "this OpenSSL build, TLS stays in user space");
+        }
+#endif
+    }
 
 #ifdef SSL_MODE_RELEASE_BUFFERS
 
@@ -1314,6 +1346,15 @@ nxt_openssl_conn_handshake(nxt_task_t *task, void *obj, void *data)
         /* ret == 1, the handshake was successfully completed. */
         tls->handshake = 1;
 
+#if (NXT_DEBUG) && defined(SSL_OP_ENABLE_KTLS) && defined(BIO_get_ktls_send)
+        if (SSL_get_options(tls->session) & SSL_OP_ENABLE_KTLS) {
+            nxt_debug(task, "openssl conn fd:%d ktls send:%d recv:%d",
+                      c->socket.fd,
+                      (int) BIO_get_ktls_send(SSL_get_wbio(tls->session)),
+                      (int) BIO_get_ktls_recv(SSL_get_rbio(tls->session)));
+        }
+#endif
+
         if (c->read_state != NULL) {
             if (state->io_read_handler != NULL || c->read != NULL) {
                 nxt_conn_read(task->thread->engine, c);
@@ -1399,6 +1440,123 @@ nxt_openssl_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b)
 }
 
 
+/*
+ * Whether the kernel can encrypt this connection's records, so a file can be
+ * sent with SSL_sendfile() instead of being read into memory.  OpenSSL moves
+ * the connection to kernel TLS during the handshake when the listener asked
+ * for it and the kernel, the cipher and the peer allow it, so the answer is
+ * only known after the handshake, which is before any request is read.
+ */
+
+static nxt_bool_t
+nxt_openssl_conn_sendfile_ready(nxt_conn_t *c)
+{
+#if (NXT_OPENSSL_KTLS_SENDFILE)
+    BIO                 *wbio;
+    nxt_openssl_conn_t  *tls;
+
+    tls = c->u.tls;
+
+    if (tls == NULL || tls->session == NULL) {
+        return 0;
+    }
+
+    if ((SSL_get_options(tls->session) & SSL_OP_ENABLE_KTLS) == 0) {
+        return 0;
+    }
+
+    wbio = SSL_get_wbio(tls->session);
+
+    return (wbio != NULL) && (BIO_get_ktls_send(wbio) != 0);
+#else
+    return 0;
+#endif
+}
+
+
+/*
+ * Sends a file buffer with SSL_sendfile(), which hands the file descriptor to
+ * the kernel: the records are encrypted there and the payload is never copied
+ * into user space.  Partial sends and the SSL_ERROR_WANT_READ/WANT_WRITE
+ * cases go through the same error path as SSL_write().
+ */
+
+static ssize_t
+nxt_openssl_conn_io_sendfile(nxt_task_t *task, nxt_sendbuf_t *sb)
+{
+#if (NXT_OPENSSL_KTLS_SENDFILE)
+    size_t              size;
+    nxt_buf_t           *b;
+    nxt_err_t           err;
+    nxt_int_t           ret;
+    nxt_conn_t          *c;
+    ossl_ssize_t        sent;
+    nxt_openssl_conn_t  *tls;
+
+    tls = sb->tls;
+    c = tls->conn;
+    b = sb->buf;
+
+    if (!nxt_openssl_conn_sendfile_ready(c)) {
+        /*
+         * nxt_http_static_send() asks sendfile_ready() before it hands a file
+         * buffer over, so kTLS was active for this connection and is not any
+         * more.  Reading the file here would need a buffer this layer does not
+         * have, and a silent fallback would hide the change, so fail.
+         */
+        nxt_log(task, NXT_LOG_ERR, "file buffer on a TLS connection without "
+                "kernel TLS fd:%d", c->socket.fd);
+
+        sb->error = NXT_EINVAL;
+        return NXT_ERROR;
+    }
+
+    size = b->file_end - b->file_pos;
+
+    sent = SSL_sendfile(tls->session, b->file->fd, b->file_pos, size, 0);
+
+    err = (sent <= 0) ? nxt_socket_errno : 0;
+
+    nxt_debug(task, "SSL_sendfile(%d, %d, @%O, %uz): %z",
+              c->socket.fd, b->file->fd, b->file_pos, size, sent);
+
+    if (sent > 0) {
+        if (sent < (ssize_t) size) {
+            /*
+             * The socket took a part of the file: do not spin on it, the
+             * write event will come back when there is room.
+             */
+            sb->ready = 0;
+        }
+
+        return sent;
+    }
+
+    c->socket.write_ready = sb->ready;
+
+    ret = nxt_openssl_conn_test_error(task, c, (int) sent, err,
+                                      NXT_OPENSSL_WRITE);
+
+    sb->ready = c->socket.write_ready;
+
+    if (ret == NXT_ERROR) {
+        sb->error = c->socket.error;
+        nxt_openssl_conn_error(task, err,
+                               "SSL_sendfile(%d, %d, @%O, %uz) failed",
+                               c->socket.fd, b->file->fd, b->file_pos, size);
+    }
+
+    return ret;
+#else
+    nxt_log(task, NXT_LOG_ERR, "file buffer on a TLS connection built without "
+            "SSL_sendfile()");
+
+    sb->error = NXT_EINVAL;
+    return NXT_ERROR;
+#endif
+}
+
+
 static ssize_t
 nxt_openssl_conn_io_sendbuf(nxt_task_t *task, nxt_sendbuf_t *sb)
 {
@@ -1409,6 +1567,15 @@ nxt_openssl_conn_io_sendbuf(nxt_task_t *task, nxt_sendbuf_t *sb)
 
     if (niov == 0 && sb->sync) {
         return 0;
+    }
+
+    /*
+     * A file buffer carries no memory to write: it is sent only when the
+     * kernel encrypts the connection, and the caller asked sendfile_ready()
+     * first.  Everything else keeps going through SSL_write().
+     */
+    if (niov == 0 && sb->buf != NULL && nxt_buf_is_file(sb->buf)) {
+        return nxt_openssl_conn_io_sendfile(task, sb);
     }
 
     return nxt_openssl_conn_io_send(task, sb, iov.iov_base, iov.iov_len);
