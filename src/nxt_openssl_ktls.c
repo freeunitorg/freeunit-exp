@@ -8,6 +8,10 @@
 #include <openssl/crypto.h>
 #include <openssl/hmac.h>
 
+#if (NXT_HAVE_KTLS)
+#include <linux/tls.h>
+#endif
+
 
 /*
  * Key material for kernel TLS.
@@ -312,3 +316,97 @@ done:
 
     return rc;
 }
+
+
+#if (NXT_HAVE_KTLS)
+
+nxt_int_t
+nxt_openssl_ktls_crypto_info(nxt_uint_t version, nxt_uint_t cipher,
+    const u_char *key, size_t key_len, const u_char *iv, size_t iv_len,
+    uint64_t rec_seq, void *info, size_t info_len)
+{
+    struct tls_crypto_info  *head;
+    u_char                  *p;
+    size_t                  key_size, size;
+    nxt_uint_t              i;
+
+    switch (cipher) {
+    case TLS_CIPHER_AES_GCM_128:
+        key_size = TLS_CIPHER_AES_GCM_128_KEY_SIZE;
+        break;
+
+    case TLS_CIPHER_AES_GCM_256:
+        key_size = TLS_CIPHER_AES_GCM_256_KEY_SIZE;
+        break;
+
+    default:
+        return NXT_ERROR;
+    }
+
+    if (key_len != key_size) {
+        return NXT_ERROR;
+    }
+
+    if (version != TLS_1_2_VERSION && version != TLS_1_3_VERSION) {
+        return NXT_ERROR;
+    }
+
+    /*
+     * The static IV is four bytes in both versions.  TLS 1.3 carries the other
+     * eight in the iv field (salt = iv[0..3], iv field = iv[4..11]); TLS 1.2
+     * puts the fixed IV in salt and starts the explicit nonce at zero, because
+     * the peer reads it from the record.  A twelve-byte TLS 1.2 IV is the
+     * RFC 7905 ChaCha20-Poly1305 layout, which nxt_openssl_ktls_tls12_keys()
+     * already refuses.
+     */
+
+    if (version == TLS_1_2_VERSION) {
+        if (iv_len != 4) {
+            return NXT_ERROR;
+        }
+
+    } else if (iv_len != 12) {
+        return NXT_ERROR;
+    }
+
+    size = sizeof(struct tls_crypto_info) + TLS_CIPHER_AES_GCM_128_IV_SIZE
+           + key_size + TLS_CIPHER_AES_GCM_128_SALT_SIZE
+           + TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE;
+
+    if (info_len < size) {
+        return NXT_ERROR;
+    }
+
+    head = info;
+    head->version = version;
+    head->cipher_type = cipher;
+
+    p = (u_char *) info + sizeof(struct tls_crypto_info);
+
+    if (version == TLS_1_3_VERSION) {
+        nxt_memcpy(p, iv + 4, TLS_CIPHER_AES_GCM_128_IV_SIZE);
+
+    } else {
+        nxt_memzero(p, TLS_CIPHER_AES_GCM_128_IV_SIZE);
+    }
+
+    p += TLS_CIPHER_AES_GCM_128_IV_SIZE;
+
+    nxt_memcpy(p, key, key_len);
+    p += key_len;
+
+    /* salt[4] = the first four bytes of the static IV. */
+
+    nxt_memcpy(p, iv, TLS_CIPHER_AES_GCM_128_SALT_SIZE);
+    p += TLS_CIPHER_AES_GCM_128_SALT_SIZE;
+
+    /* rec_seq[8]: the record sequence, network order. */
+
+    for (i = 0; i < TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE; i++) {
+        p[i] = (u_char) (rec_seq >> (8 * (7 - i)));
+    }
+
+    return NXT_OK;
+}
+
+#endif

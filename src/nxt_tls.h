@@ -109,6 +109,19 @@ nxt_int_t nxt_openssl_ktls_tls12_keys(const u_char *master, size_t master_len,
     const u_char *client_random, const u_char *server_random, nxt_bool_t sha384,
     nxt_bool_t server, size_t iv_len, u_char *key, size_t key_len, u_char *iv);
 
+#if (NXT_HAVE_KTLS)
+/*
+ * Builds the kernel's crypto_info from the derived key material: version and
+ * cipher_type host-endian, the static IV split into salt[4] and the 8-byte iv
+ * field, the key, and the record sequence in network order.  Returns NXT_ERROR
+ * for a key length that does not match the cipher, an IV length the version
+ * does not take, or a cipher id that is not one of the two AES-GCM ids.
+ */
+nxt_int_t nxt_openssl_ktls_crypto_info(nxt_uint_t version, nxt_uint_t cipher,
+    const u_char *key, size_t key_len, const u_char *iv, size_t iv_len,
+    uint64_t rec_seq, void *info, size_t info_len);
+#endif
+
 #if (NXT_TESTS)
 /*
  * Makes nxt_openssl_server_init() take one of its failure paths, for
