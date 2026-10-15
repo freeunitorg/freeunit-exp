@@ -67,9 +67,23 @@ jobs:
         run: |
           if [ "$EVENT" = pull_request ]; then
             base=$(git rev-parse HEAD^1)
-          else
-            git fetch --no-tags --depth=1 origin "$EVENT_BASE"
+          elif [ -z "$EVENT_BASE" ] || \
+               [ "$EVENT_BASE" = 0000000000000000000000000000000000000000 ]; then
+            # A push that creates the branch has no base on the remote.
+            # Compare the tip commit only; the pull-request runs cover
+            # the rest.
+            base=$(git rev-parse HEAD^)
+          elif git fetch --no-tags --depth=1 origin "$EVENT_BASE" 2>fetch.err; then
             base=$EVENT_BASE
+          elif grep -q "not our ref" fetch.err; then
+            # A force-push whose base the remote no longer serves has the
+            # same honest base: the tip commit only.
+            base=$(git rev-parse HEAD^)
+          else
+            # Any other fetch error (network, auth) must fail the step,
+            # not silently check against the wrong base.
+            cat fetch.err >&2
+            exit 1
           fi
           echo "sha=$base" >> "$GITHUB_OUTPUT"
 
