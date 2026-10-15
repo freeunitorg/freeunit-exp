@@ -211,7 +211,12 @@ nxt_ktls_keys_test(nxt_thread_t *thr)
 #if (NXT_HAVE_KTLS)
 
     {
-        struct tls13_crypto_info_aes_gcm_128  t13;
+        /*
+         * The kernel declares no TLS 1.3 crypto_info type: TLS 1.3 reuses the
+         * tls12 structures and carries the version in info.version.  A type
+         * named tls13_... here would not compile against the UAPI headers.
+         */
+        struct tls12_crypto_info_aes_gcm_128  t13;
         struct tls12_crypto_info_aes_gcm_128  t12;
         struct tls12_crypto_info_aes_gcm_256  t12256;
         struct tls12_crypto_info_aes_gcm_128  scratch;
@@ -238,19 +243,19 @@ nxt_ktls_keys_test(nxt_thread_t *thr)
         /* The struct layout is the kernel ABI: pin every field offset. */
 
         if (nxt_ktls_test_offset(thr, "tls13 128 version",
-                offsetof(struct tls13_crypto_info_aes_gcm_128, info.version), 0)
+                offsetof(struct tls12_crypto_info_aes_gcm_128, info.version), 0)
                 != NXT_OK
             || nxt_ktls_test_offset(thr, "tls13 128 cipher_type",
-                offsetof(struct tls13_crypto_info_aes_gcm_128, info.cipher_type),
+                offsetof(struct tls12_crypto_info_aes_gcm_128, info.cipher_type),
                 2) != NXT_OK
             || nxt_ktls_test_offset(thr, "tls13 128 iv",
-                offsetof(struct tls13_crypto_info_aes_gcm_128, iv), 4) != NXT_OK
+                offsetof(struct tls12_crypto_info_aes_gcm_128, iv), 4) != NXT_OK
             || nxt_ktls_test_offset(thr, "tls13 128 key",
-                offsetof(struct tls13_crypto_info_aes_gcm_128, key), 12) != NXT_OK
+                offsetof(struct tls12_crypto_info_aes_gcm_128, key), 12) != NXT_OK
             || nxt_ktls_test_offset(thr, "tls13 128 salt",
-                offsetof(struct tls13_crypto_info_aes_gcm_128, salt), 28) != NXT_OK
+                offsetof(struct tls12_crypto_info_aes_gcm_128, salt), 28) != NXT_OK
             || nxt_ktls_test_offset(thr, "tls13 128 rec_seq",
-                offsetof(struct tls13_crypto_info_aes_gcm_128, rec_seq), 32)
+                offsetof(struct tls12_crypto_info_aes_gcm_128, rec_seq), 32)
                 != NXT_OK
             || nxt_ktls_test_offset(thr, "tls12 128 version",
                 offsetof(struct tls12_crypto_info_aes_gcm_128, info.version), 0)
