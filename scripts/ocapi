@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""ocapi - thin CLI wrapper over the OpenCode v2 HTTP API.
+
+Talk to OpenCode sessions and agents on the shared background service without
+the TUI. Stdlib only (no pip), matching the other freeunit-epx/scripts helpers.
+
+Discovery: reads ~/.local/state/opencode/service.json (url + password), with
+~/.config/opencode/service.json and `opencode service status` as fallbacks.
+Auth: HTTP Basic, user "opencode". Override with OCAPI_SERVER / OCAPI_PASSWORD,
+or the global --server / --password flags.
+
+Usage:
+  ocapi info [--json]
+  ocapi agents [--json]
+  ocapi models [--search TEXT] [--json]
+  ocapi sessions [--limit N] [--search TEXT] [--dir PATH] [--json]
+  ocapi active [--json]
+  ocapi new [--agent A] [--model provider/id[#variant]] [--title T] [--dir PATH] [--parent SID] [--json]
+  ocapi send <session> <text...>            # enqueue a prompt (async)
+  ocapi ask  <session> <text...>            # prompt, wait for idle, print reply
+  ocapi chat [--agent A] [--keep] <text...> # one-shot: new session -> ask -> delete
+  ocapi messages <session> [--limit N] [--reasoning] [--json]
+  ocapi reply <session> [--reasoning]       # last assistant text
+  ocapi wait <session>
+  ocapi rm <session>...
+  ocapi export <session> [outfile]
+  ocapi watch [--filter TYPE] [--duration SEC]
+
+Global flags: --json, --server URL, --password PW, --timeout SEC
+
+Exit codes: 0 ok, 1 error, 2 usage/discovery failure.
+"""
+
+import argparse
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+STATE_JSON = os.path.expanduser("~/.local/state/opencode/service.json")
+CONF_JSON = os.path.expanduser("~/.config/opencode/service.json")
+AUTH_USER = "opencode"
+
+
+class ApiError(Exception):
+    def __init__(self, status, body):
+        self.status = status
+        self.body = body
+        super().__init__(f"HTTP {status}: {body.strip()[:300]}")
+
+
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def discover(args):
+    url = args.server or os.environ.get("OCAPI_SERVER")
+    pw = args.password or os.environ.get("OCAPI_PASSWORD")
+    state = _read_json(STATE_JSON)
+    url = url or state.get("url")
+    pw = pw or state.get("password") or _read_json(CONF_JSON).get("password")
+    if not url:
+        try:
+            out = subprocess.run(
+                ["opencode", "service", "status"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip().splitlines()
+            for line in out:
+                if line.startswith("http"):
+                    url = line.strip()
+                    break
+        except Exception:
+            pass
+    if not url or not pw:
+        sys.stderr.write(
+            "ocapi: cannot discover the OpenCode service url/password.\n"
+            "       Is the background service running? Try: opencode service status\n"
+        )
+        sys.exit(2)
+    return url.rstrip("/"), pw
+
+
+class Client:
+    def __init__(self, url, password, timeout=30.0):
+        self.url = url
+        self.timeout = timeout
+        token = base64.b64encode(f"{AUTH_USER}:{password}".encode()).decode()
+        self.auth = "Basic " + token
+
+    def _request(self, method, path, params=None, body=None, timeout=None):
+        query = {k: v for k, v in (params or {}).items() if v is not None}
+        target = self.url + path
+        if query:
+            target += "?" + urllib.parse.urlencode(query)
+        data = None
+        headers = {"Authorization": self.auth, "Accept": "application/json"}
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(target, data=data, headers=headers,
+                                     method=method.upper())
+        try:
+            return urllib.request.urlopen(req, timeout=timeout or self.timeout)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise ApiError(exc.code,
+                           f"{method.upper()} {path} -> {detail}") from None
+        except urllib.error.URLError as exc:
+            sys.stderr.write(
+                f"ocapi: cannot reach {self.url}: {exc.reason}\n"
+                "       Try: opencode service status\n"
+            )
+            sys.exit(1)
+
+    def call(self, method, path, params=None, body=None, timeout=None):
+        resp = self._request(method, path, params, body, timeout)
+        with resp:
+            raw = resp.read()
+        return json.loads(raw) if raw else None
+
+    def stream(self, path, params=None):
+        return self._request("GET", path, params)
+
+    # --- convenience -------------------------------------------------------
+    def get(self, path, **params):
+        return self.call("GET", path, params=params)
+
+    def post(self, path, body=None, **params):
+        return self.call("POST", path, params=params, body=body)
+
+    def delete(self, path):
+        return self.call("DELETE", path)
+
+
+def parse_model(text):
+    if not text:
+        return None
+    ref = text
+    variant = None
+    if "#" in ref:
+        ref, variant = ref.split("#", 1)
+    provider, _, model_id = ref.partition("/")
+    if not model_id:
+        provider, model_id = "", provider
+    out = {"id": model_id}
+    if provider:
+        out["providerID"] = provider
+    if variant:
+        out["variant"] = variant
+    return out
+
+
+def msg_text(message, reasoning=False):
+    """Extract display text from an assistant message."""
+    parts = []
+    for chunk in message.get("content") or []:
+        if not isinstance(chunk, dict):
+            continue
+        ctype = chunk.get("type")
+        if ctype == "text":
+            parts.append(chunk.get("text", ""))
+        elif ctype == "reasoning" and reasoning:
+            parts.append(f"[reasoning] {chunk.get('text', '')}")
+        elif ctype == "tool":
+            parts.append(f"[tool {chunk.get('tool')}]")
+    return "".join(parts)
+
+
+def last_assistant(msgs, reasoning=False):
+    """Newest assistant message that actually contains text.
+
+    The message list order is not relied upon (the API can return newest-first
+    or oldest-first); we compare time.created instead.
+    """
+    newest_text = ""
+    newest_at = -1.0
+    for m in msgs:
+        if m.get("type") != "assistant":
+            continue
+        body = msg_text(m, reasoning)
+        if not body:
+            continue
+        at = (m.get("time") or {}).get("created", 0) or 0
+        if at >= newest_at:
+            newest_at = at
+            newest_text = body
+    return newest_text
+
+
+def wait_for(client, sid, timeout=900.0):
+    client.call("POST", f"/api/experimental/session/{sid}/wait", timeout=timeout)
+
+
+# --- commands -------------------------------------------------------------
+
+
+def cmd_info(client, args):
+    data = client.get("/api/info")
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    print(f"version : {data.get('version')}")
+    print(f"pid     : {data.get('pid')}")
+    print(f"urls    : {', '.join(data.get('urls') or [])}")
+    caps = data.get("capabilities") or {}
+    print(f"caps    : {', '.join(k for k, v in caps.items() if v) or '-'}")
+
+
+def cmd_agents(client, args):
+    data = client.get("/api/agent")["data"]
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    print(f"{'id':<12} {'mode':<9} {'hidden':<6} description")
+    for a in data:
+        print(f"{a['id']:<12} {a.get('mode', '?'):<9} "
+              f"{str(a.get('hidden', False)):<6} {(a.get('description') or '')[:60]}")
+
+
+def cmd_models(client, args):
+    data = client.get("/api/model")["data"]
+    if args.search:
+        needle = args.search.lower()
+        data = [m for m in data
+                if needle in m.get("id", "").lower()
+                or needle in (m.get("name") or "").lower()
+                or needle in m.get("providerID", "").lower()]
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    for m in data:
+        print(f"{m.get('providerID')}/{m.get('id'):<28} {m.get('name') or ''}")
+
+
+def _fmt_time(ms):
+    if not ms:
+        return "-"
+    delta = int(time.time() - ms / 1000.0)
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
+def cmd_sessions(client, args):
+    params = {"limit": args.limit, "search": args.search, "directory": args.dir}
+    resp = client.get("/api/session", **params)
+    data = resp["data"]
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return
+    print(f"{'session id':<34} {'agent':<10} {'cost':>8}  updated      title")
+    for s in data:
+        title = (s.get("title") or "(untitled)")[:44]
+        print(f"{s['id']:<34} {str(s.get('agent'))[:10]:<10} "
+              f"{s.get('cost', 0):>8.4f}  "
+              f"{_fmt_time((s.get('time') or {}).get('updated')):<12} {title}")
+    cur = resp.get("cursor") or {}
+    if cur.get("next"):
+        sys.stdout.flush()
+        print(f"-- more: --cursor {cur['next']}", file=sys.stderr)
+
+
+def cmd_active(client, args):
+    data = client.get("/api/session/active")["data"]
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    if not data:
+        print("no active sessions")
+    for sid, info in data.items():
+        print(f"{sid}  {info.get('type')}")
+
+
+def cmd_new(client, args):
+    body = {}
+    if args.title:
+        body["title"] = args.title
+    if args.agent:
+        body["agent"] = args.agent
+    if args.model:
+        body["model"] = parse_model(args.model)
+    if args.dir:
+        body["location"] = {"directory": args.dir}
+    if args.parent:
+        body["parentID"] = args.parent
+    session = client.post("/api/session", body)["data"]
+    if args.json:
+        print(json.dumps(session, indent=2))
+    else:
+        print(session["id"])
+    return session["id"]
+
+
+def _prompt_text(parts):
+    if parts == ["-"] or not parts:
+        return sys.stdin.read().strip()
+    return " ".join(parts)
+
+
+def cmd_send(client, args):
+    text = _prompt_text(args.text)
+    res = client.post(f"/api/session/{args.session}/prompt", {"text": text})["data"]
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"queued ({res.get('type')}/{res.get('delivery')}) -> {args.session}")
+
+
+def cmd_ask(client, args):
+    text = _prompt_text(args.text)
+    client.post(f"/api/session/{args.session}/prompt", {"text": text})
+    wait_for(client, args.session, args.wait_timeout)
+    msgs = client.get(f"/api/session/{args.session}/message",
+                      limit=200)["data"]
+    reply = last_assistant(msgs, args.reasoning)
+    if args.json:
+        print(json.dumps({"session": args.session, "reply": reply}, indent=2))
+    else:
+        print(reply)
+
+
+def cmd_chat(client, args):
+    body = {"title": args.title or "(ocapi one-shot)"}
+    if args.agent:
+        body["agent"] = args.agent
+    if args.model:
+        body["model"] = parse_model(args.model)
+    if args.dir:
+        body["location"] = {"directory": args.dir}
+    sid = client.post("/api/session", body)["data"]["id"]
+    try:
+        text = _prompt_text(args.text)
+        client.post(f"/api/session/{sid}/prompt", {"text": text})
+        wait_for(client, sid, args.wait_timeout)
+        msgs = client.get(f"/api/session/{sid}/message", limit=200)["data"]
+        reply = last_assistant(msgs, args.reasoning)
+        if args.json:
+            print(json.dumps({"session": sid, "reply": reply}, indent=2))
+        else:
+            print(reply, file=sys.stdout)
+    finally:
+        if not args.keep:
+            try:
+                client.delete(f"/api/session/{sid}")
+            except ApiError as exc:
+                sys.stderr.write(f"ocapi: cleanup failed for {sid}: {exc}\n")
+        else:
+            sys.stderr.write(f"kept session {sid}\n")
+
+
+def cmd_messages(client, args):
+    data = client.get(f"/api/session/{args.session}/message",
+                      limit=args.limit, order="asc")["data"]
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    for m in data:
+        mtype = m.get("type")
+        if mtype == "user":
+            print(f"USER: {m.get('text', '')}")
+        elif mtype == "assistant":
+            body = msg_text(m, args.reasoning)
+            if body:
+                print(f"ASSISTANT: {body}")
+        else:
+            print(f"[{mtype}]")
+
+
+def cmd_reply(client, args):
+    msgs = client.get(f"/api/session/{args.session}/message",
+                      limit=args.limit)["data"]
+    print(last_assistant(msgs, args.reasoning))
+
+
+def cmd_wait(client, args):
+    wait_for(client, args.session, args.wait_timeout)
+    print("idle")
+
+
+def cmd_rm(client, args):
+    for sid in args.session:
+        client.delete(f"/api/session/{sid}")
+        print(f"deleted {sid}")
+
+
+def cmd_export(client, args):
+    data = client.get(f"/api/experimental/session/{args.session}/export")
+    payload = json.dumps(data, indent=2)
+    if args.outfile:
+        with open(args.outfile, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        print(f"wrote {args.outfile}")
+    else:
+        print(payload)
+
+
+def cmd_watch(client, args):
+    resp = client.stream("/api/event")
+    deadline = time.time() + args.duration if args.duration else None
+    try:
+        for raw in resp:
+            line = raw.decode(errors="replace").rstrip("\n")
+            if not line:
+                continue
+            if args.filter and args.filter not in line:
+                continue
+            print(line, flush=True)
+            if deadline and time.time() > deadline:
+                break
+    except KeyboardInterrupt:
+        pass
+    except (urllib.error.URLError, TimeoutError, OSError):
+        pass
+    finally:
+        resp.close()
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="ocapi", description="CLI wrapper over the OpenCode v2 HTTP API.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--server", help="service base URL (default: auto-discover)")
+    p.add_argument("--password", help="service password (default: auto-discover)")
+    p.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout seconds")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help_text):
+        sp = sub.add_parser(name, help=help_text)
+        sp.set_defaults(func=fn)
+        return sp
+
+    add("info", cmd_info, "server info")
+    add("agents", cmd_agents, "list agents")
+    add("active", cmd_active, "list active sessions")
+
+    m = add("models", cmd_models, "list models")
+    m.add_argument("--search")
+
+    s = add("sessions", cmd_sessions, "list sessions")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--search")
+    s.add_argument("--dir")
+
+    n = add("new", cmd_new, "create a session")
+    n.add_argument("--agent")
+    n.add_argument("--model")
+    n.add_argument("--title")
+    n.add_argument("--dir")
+    n.add_argument("--parent")
+
+    for name, fn, helptext in [
+        ("send", cmd_send, "enqueue a prompt (async)"),
+        ("ask", cmd_ask, "prompt, wait, print reply"),
+    ]:
+        sp = add(name, fn, helptext)
+        sp.add_argument("session")
+        sp.add_argument("text", nargs="*")
+        sp.add_argument("--reasoning", action="store_true")
+        sp.add_argument("--wait-timeout", type=float, default=900.0)
+
+    c = add("chat", cmd_chat, "one-shot new session -> ask -> delete")
+    c.add_argument("text", nargs="*")
+    c.add_argument("--agent")
+    c.add_argument("--model")
+    c.add_argument("--title")
+    c.add_argument("--dir")
+    c.add_argument("--reasoning", action="store_true")
+    c.add_argument("--wait-timeout", type=float, default=900.0)
+    c.add_argument("--keep", action="store_true",
+                   help="keep the session instead of deleting it")
+
+    mm = add("messages", cmd_messages, "show session messages")
+    mm.add_argument("session")
+    mm.add_argument("--limit", type=int, default=100)
+    mm.add_argument("--reasoning", action="store_true")
+
+    r = add("reply", cmd_reply, "last assistant text")
+    r.add_argument("session")
+    r.add_argument("--limit", type=int, default=200)
+    r.add_argument("--reasoning", action="store_true")
+
+    w = add("wait", cmd_wait, "wait for session idle")
+    w.add_argument("session")
+    w.add_argument("--wait-timeout", type=float, default=900.0)
+
+    rm = add("rm", cmd_rm, "delete session(s)")
+    rm.add_argument("session", nargs="+")
+
+    e = add("export", cmd_export, "export a session as JSON")
+    e.add_argument("session")
+    e.add_argument("outfile", nargs="?")
+
+    wf = add("watch", cmd_watch, "stream /api/event (SSE)")
+    wf.add_argument("--filter")
+    wf.add_argument("--duration", type=float, default=0.0,
+                    help="stop after SEC seconds (0 = until interrupted)")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    url, password = discover(args)
+    client = Client(url, password, args.timeout)
+    try:
+        args.func(client, args)
+    except ApiError as exc:
+        sys.stderr.write(f"ocapi: {exc}\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
