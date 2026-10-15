@@ -1,0 +1,50 @@
+{
+  "$schema": "schema.json",
+  "version": 1,
+  "entries": [
+    {
+      "id": "acme-sh",
+      "name": "acme.sh",
+      "description": "External ACME client. Gets and renews the certificate; a deploy hook uploads it with PUT /certificates/<name>. Any ACME CA.",
+      "category": "acme-client",
+      "scope": "worldwide",
+      "trust": "in-browser-store",
+      "issuer": "Let's Encrypt, ZeroSSL, any ACME CA",
+      "depends_on": []
+    },
+    {
+      "id": "acme-sh-nuc",
+      "name": "acme.sh + НУЦ (Russian National CA)",
+      "description": "Stock acme.sh with an openssl CSR (C=RU + keyUsage) against the НУЦ ACME directory; deploy hook PUTs the bundle. No core change.",
+      "category": "cert-hook",
+      "scope": "country",
+      "country": "RU",
+      "trust": "self-installed",
+      "issuer": "НУЦ (Russian Trusted Root CA)",
+      "depends_on": ["acme-sh"],
+      "source": "exp/acme-sh-nuc/"
+    },
+    {
+      "id": "acme-sh-qaznet",
+      "name": "acme.sh + Qaznet Trust Network",
+      "description": "Kazakhstan national root; the operator installs the root, browsers block it.",
+      "category": "cert-hook",
+      "scope": "country",
+      "country": "KZ",
+      "trust": "self-installed",
+      "issuer": "Qaznet Trust Network",
+      "depends_on": ["acme-sh"]
+    },
+    {
+      "id": "acme-sh-iran",
+      "name": "acme.sh + Iranian national CA",
+      "description": "Iranian national root; valid only inside Iran, not in browser stores.",
+      "category": "cert-hook",
+      "scope": "country",
+      "country": "IR",
+      "trust": "self-installed",
+      "issuer": "Iranian national Root CA",
+      "depends_on": ["acme-sh"]
+    }
+  ]
+}
