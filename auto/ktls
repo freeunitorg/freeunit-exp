@@ -1,0 +1,42 @@
+
+# Copyright (C) Igor Sysoev
+# Copyright (C) NGINX, Inc.
+
+
+# Linux kTLS: the kernel takes over the TLS record layer, which is what allows sendfile() to
+# drive a TLS connection again (TLS forces it off today, see nxt_openssl_conn_init()).
+#
+# A build can only answer whether the interface exists: the `tls` module may be absent from
+# the running kernel, and that is decided at runtime by nxt_ktls_supported().  Both carry the
+# same name deliberately, so a build with the header can still report "not available".
+
+NXT_HAVE_KTLS=NO
+
+
+nxt_feature="Linux kTLS (SOL_TLS, TLS_TX/TLS_RX)"
+nxt_feature_name=NXT_HAVE_KTLS
+nxt_feature_run=
+nxt_feature_incs=
+nxt_feature_libs=
+nxt_feature_test="#include <sys/socket.h>
+                  #include <netinet/tcp.h>
+                  #include <linux/tls.h>
+
+                  int main(void) {
+                      struct tls12_crypto_info_aes_gcm_128  info;
+
+                      info.info.version = TLS_1_2_VERSION;
+                      info.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+
+                      return (int) info.info.cipher_type + TLS_TX + TLS_RX + SOL_TLS
+                             + TCP_ULP;
+                  }"
+. auto/feature
+
+
+# The shell variable is what auto/sources tests to add src/nxt_ktls.c to NXT_LIB_SRCS;
+# auto/feature only defines the macro in the generated header.  Without this line the file
+# is never compiled, the build stays green, and nothing exercises it.
+if [ $nxt_found = yes ]; then
+    NXT_HAVE_KTLS=YES
+fi
