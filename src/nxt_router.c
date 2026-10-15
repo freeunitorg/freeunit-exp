@@ -1457,16 +1457,25 @@ nxt_request_rpc_data_unlink(nxt_task_t *task,
         if (app != NULL) {
             unlinked = 0;
 
-            nxt_thread_mutex_lock(&app->mutex);
+            /*
+             * The request's own thread clears the flag when it unlinks, so
+             * a zero here proves the queue no longer points at the request
+             * and the application lock can be skipped.  A one can be stale
+             * -- the main thread's drain removes the link but leaves the
+             * flag -- so the queue is always re-checked under the lock.
+             */
+            if (nxt_atomic_xchg(&req_rpc_data->app_linked, 0) != 0) {
+                nxt_thread_mutex_lock(&app->mutex);
 
-            if (r->app_link.next != NULL) {
-                nxt_queue_remove(&r->app_link);
-                r->app_link.next = NULL;
+                if (r->app_link.next != NULL) {
+                    nxt_queue_remove(&r->app_link);
+                    r->app_link.next = NULL;
 
-                unlinked = 1;
+                    unlinked = 1;
+                }
+
+                nxt_thread_mutex_unlock(&app->mutex);
             }
-
-            nxt_thread_mutex_unlock(&app->mutex);
 
             if (unlinked) {
                 nxt_mp_release(r->mem_pool);
@@ -6526,6 +6535,8 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
         nxt_queue_remove(&r->app_link);
         r->app_link.next = NULL;
 
+        nxt_atomic_xchg(&req_rpc_data->app_linked, 0);
+
         unlinked = 1;
     }
 
@@ -8211,6 +8222,8 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
      * if something goes wrong with application processes.
      */
     nxt_queue_insert_tail(&app->ack_waiting_req, &r->app_link);
+
+    nxt_atomic_xchg(&req_rpc_data->app_linked, 1);
 
     nxt_thread_mutex_unlock(&app->mutex);
 

@@ -282,6 +282,7 @@ nxt_router_app_timeout_test_arm(nxt_task_t *task, nxt_event_engine_t *engine,
 
     app->active_requests++;
     nxt_queue_insert_tail(&app->ack_waiting_req, &r->app_link);
+    nxt_atomic_xchg(&req_rpc_data->app_linked, 1);
 
     nxt_thread_mutex_unlock(&app->mutex);
 
