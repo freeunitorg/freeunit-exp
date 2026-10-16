@@ -442,9 +442,21 @@ jobs:
             # built, so one Python leg is enough for it.  The other language
             # legs still run it.  A file that is not in this list only costs
             # balance, not coverage.
+            #
+            # test_settings.py was 64 s in that run.  It cost 180 s on the
+            # python-3.13 leg of
+            # https://github.com/freeunitorg/freeunit/actions/runs/38018584167
+            # measured by summing the gaps between consecutive tests of the
+            # file in the leg's log.  That leg ran 359 s against 253 s and
+            # 283 s on python-3.12 and python-3.14, because the entry sent
+            # the largest shared file to the leg that already had the most
+            # work.  The 408 change in the same pull request removes about
+            # 7 s of sleeps, so the cost is about 174 s.  The entry uses 170
+            # s: the shards only need a good balance.  Re-measure a file when
+            # its cost changes.
             heavy="
               test/test_app_start_timeout.py:72
-              test/test_settings.py:64
+              test/test_settings.py:170
               test/test_otel.py:34
               test/test_proxy.py:27
               test/test_tls.py:22
@@ -864,7 +876,7 @@ jobs:
       # Prebuilt binary instead of `cargo install cargo-component` (which
       # compiles it from source on every run). Same tool, much faster.
       - name: Install cargo-component
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
@@ -1107,10 +1119,14 @@ jobs:
         timeout-minutes: 5
         run: |
           sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+            systemtap-sdt-dev
 
-      - name: Configure unit (--tests)
-        run: ./configure --openssl --tests
+      # --usdt is here because no other job compiles the probes.  The other
+      # C test jobs build without it, so nxt_usdt_test runs with and without
+      # the probes.
+      - name: Configure unit (--tests --usdt)
+        run: ./configure --openssl --tests --usdt
 
       - name: Build unitd and libunit
         run: |
@@ -1119,6 +1135,18 @@ jobs:
 
       - name: Build C tests
         run: make -j4 tests
+
+      # Every NXT_USDT() name in the source must be a probe note in unitd or
+      # libunit.a.  A probe in a language module needs its module added here.
+      - name: Check the USDT probes are in the build
+        run: |
+          src=$(grep -rhoE --exclude-dir=test --exclude=nxt_usdt.h \
+                  'NXT_USDT\([a-z_]+' src | sed 's/NXT_USDT(//' | sort -u)
+          bin=$(LC_ALL=C readelf -n build/sbin/unitd build/lib/libunit.a |
+                  sed -n 's/^ *Name: //p' | sort -u)
+          echo "$src"
+          test -n "$src"
+          test "$src" = "$bin"
 
       # The hooks (fault-injection branches and counters inside
       # "#if (NXT_TESTS)") must reach the test programs and nothing else.
@@ -1179,6 +1207,98 @@ jobs:
       - name: Run C tests
         run: sudo ./build/tests
 
+  # JIT is opt-in, so the default jobs do not execute its regression cases.
+  c-tests-jit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, address]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+
+      - name: Configure unit with PCRE2 JIT
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          if [ "$SANITIZER" = address ]; then
+            ASAN_OPTIONS=detect_leaks=0 ./configure \
+              --openssl --debug --hardening=strict --tests --regex-jit \
+              --cc-opt='-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g' \
+              --ld-opt='-fsanitize=address,undefined'
+          else
+            ./configure --openssl --debug --hardening=strict --tests --regex-jit
+          fi
+
+      - name: Build unitd, libunit and C tests
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+          make -j4 tests
+
+      - name: Check test-hook isolation
+        run: .github/scripts/check-test-hooks.sh
+
+      - name: Run C tests
+        run: |
+          set -o pipefail
+          sudo env ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            ./build/tests 2>&1 | tee jit-tests.log
+          grep -F 'regex JIT test passed: execution, fallback, cleanup' jit-tests.log
+
+  # The routing tests against a --regex-jit build: configuration
+  # validation, route matching on the engine threads, reconfiguration and
+  # the limit-hit error with JIT-compiled patterns.  Its own build, so the
+  # shared core build that the other pytest legs use stays without JIT.
+  routing-jit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      - name: Install packages
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+            python3-dev python3-pytest
+
+      - name: Configure unit with PCRE2 JIT
+        run: ./configure --openssl --debug --regex-jit
+
+      - name: Make unit and the python3 module
+        run: |
+          make -j4
+          ./configure python --config=python3-config
+          make -j4 python3
+
+      - name: Assert the build has --regex-jit
+        run: ./build/sbin/unitd --version 2>&1 | grep -F -- --regex-jit
+
+      # The test files with "~" route or match patterns.  The one in
+      # test_static_compression.py is left out: it needs a --zlib build.
+      # --port as in the test legs, so the run is off the default base port.
+      - name: Run routing tests
+        timeout-minutes: 8
+        run: |
+          sudo /usr/bin/pytest-3 --print-log --port 18080 \
+            test/test_routing.py \
+            test/test_route_if.py \
+            test/test_static_types.py
+
   # Same C unit-test suite as c-tests above, built with AddressSanitizer and
   # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
   # something turns it off). Separate from sanitize.yml: that workflow runs
@@ -1191,8 +1311,29 @@ jobs:
   # (test fixtures freeing what they allocated -- lvlhsh buckets, ports,
   # runtime processes).
   c-tests-asan:
+    # Both compilers, or the C core is sanitized by exactly one of them.  The
+    # gcc branches of the sanitizer detection that
+    # https://github.com/freeunitorg/freeunit/pull/693 adds to nxt_clang.h
+    # (__SANITIZE_ADDRESS__ and friends) would then never run here.  Both legs
+    # of this matrix use one flag set, so a UBSan report fails both or
+    # neither.  The runtime leg in sanitize.yml keeps UBSan recoverable on
+    # purpose: aborting on the first report kills an exec'd application worker
+    # mid-response (see the halt_on_error note and the "Configure unit"
+    # comment there).  This leg runs one test process with no allowlist, so it
+    # fails fast.
+    # MemorySanitizer cannot be added to this matrix: gcc rejects the option
+    # outright ("unrecognized argument to '-fsanitize=' option: 'memory'", gcc
+    # 15.3.0 and 16.2.0), so MSan stays a clang-only leg.  HWAddressSanitizer
+    # builds on both compilers but aborts at startup on x86_64 ("requires a
+    # kernel with tagged address ABI"), so it belongs on an aarch64 leg.
+    name: "c-tests-asan (${{ matrix.cc }})"
     runs-on: ubuntu-26.04
     timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [clang, gcc]
 
     steps:
       - uses: actions/checkout@v7
@@ -1210,14 +1351,26 @@ jobs:
 
       # -fno-sanitize-recover: the first UBSan report fails the job.
       # nxt_conf_map_object_test fails only under UBSan.
+      #
+      # -O1 is spelled out as in sanitize.yml: --cc-opt lands after the
+      # built-in -O, so a change of that default cannot split the two
+      # workflows.
+      #
+      # detect_leaks=0 for configure only, as in sanitize.yml: auto/feature
+      # runs its probes, and auto/malloc's malloc_usable_size() probe does not
+      # free.  With LeakSanitizer on, the probe exits nonzero, configure
+      # prints "found but is not working", and NXT_HAVE_MALLOC_USABLE_SIZE is
+      # dropped.  The tests below still run with leak detection on.
       - name: Configure unit (ASan+LSan+UBSan, --tests, --openssl)
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
         run: |
           ./configure \
-            --cc=clang \
+            --cc=${{ matrix.cc }} \
             --debug \
             --tests \
             --openssl \
-            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" \
+            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g" \
             --ld-opt="-fsanitize=address,undefined"
 
       # The hook gate needs the plain objects as well as the instrumented ones:

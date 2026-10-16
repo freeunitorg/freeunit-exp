@@ -135,7 +135,7 @@ nxt_router_start_fail_test(nxt_thread_t *thr)
 
     if (app->pending_processes != 0) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                      "router start fail test: pending_processes %uD leaked "
+                      "router start fail test: pending_processes %uA leaked "
                       "(expected 0)", app->pending_processes);
         goto done;
     }

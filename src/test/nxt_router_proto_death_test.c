@@ -191,7 +191,7 @@ nxt_router_proto_death_test(nxt_thread_t *thr)
     {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router proto death test: successful start left "
-                      "pending %uD joint %uD app use %d (expected 1, 2 and 1)",
+                      "pending %uA joint %uD app use %d (expected 1, 2 and 1)",
                       app->pending_processes, joint->use_count,
                       (int) app->use_count);
         goto done;
