@@ -2399,10 +2399,12 @@ nxt_router_test_temp_conf(nxt_task_t *task)
 nxt_inline nxt_bool_t
 nxt_router_app_need_start(nxt_app_t *app)
 {
-    return (app->active_requests
-              > app->port_hash_count + app->pending_processes)
+    return (nxt_atomic_load(&app->active_requests)
+              > nxt_atomic_load(&app->port_hash_count)
+                + nxt_atomic_load(&app->pending_processes))
            || (app->spare_processes
-                > app->idle_processes + app->pending_processes);
+                > nxt_atomic_load(&app->idle_processes)
+                  + nxt_atomic_load(&app->pending_processes));
 }
 
 

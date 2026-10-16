@@ -253,9 +253,12 @@ struct nxt_app_s {
 nxt_inline nxt_bool_t
 nxt_router_app_can_start(nxt_app_t *app)
 {
-    return app->processes + app->pending_processes
-               + app->unaccounted_processes < app->max_processes
-            && app->pending_processes < app->max_pending_processes;
+    return nxt_atomic_load(&app->processes)
+               + nxt_atomic_load(&app->pending_processes)
+               + nxt_atomic_load(&app->unaccounted_processes)
+               < app->max_processes
+            && nxt_atomic_load(&app->pending_processes)
+                 < app->max_pending_processes;
 }
 
 
