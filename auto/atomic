@@ -28,6 +28,8 @@ nxt_feature_test="int main(void) {
                       __sync_lock_release(&n);
                       if (n != 0)
                           return 1;
+                      if (__atomic_load_n(&n, __ATOMIC_RELAXED) != 0)
+                          return 1;
                       return 0;
                   }"
 . auto/feature

@@ -38,6 +38,16 @@ typedef volatile nxt_atomic_uint_t  nxt_atomic_t;
     __sync_fetch_and_add(value, add)
 
 
+/*
+ * An atomic load, for readers that race an update without taking the lock
+ * the writer holds.  A plain read of an nxt_atomic_t is still a data race;
+ * a decision over several fields needs the lock instead.
+ */
+
+#define nxt_atomic_load(value)                                                \
+    __atomic_load_n(value, __ATOMIC_RELAXED)
+
+
 #define nxt_atomic_try_lock(lock)                                             \
     nxt_atomic_cmp_set(lock, 0, 1)
 

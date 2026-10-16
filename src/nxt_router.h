@@ -164,12 +164,20 @@ struct nxt_app_s {
 
     nxt_str_t              name;
 
-    uint32_t               port_hash_count;
+    /*
+     * The accounting counters are atomics.  The config-apply prefork path
+     * updates some of them without the application lock, so a plain uint32_t
+     * was a C-level data race; the atomic type makes those updates defined.
+     * The gate on the request path still reads them under app->mutex, and the
+     * lock still serializes the port set and the queue transitions the
+     * counters describe.
+     */
+    nxt_atomic_t           port_hash_count;
 
-    uint32_t               active_requests;
-    uint32_t               pending_processes;
-    uint32_t               processes;
-    uint32_t               idle_processes;
+    nxt_atomic_t           active_requests;
+    nxt_atomic_t           pending_processes;
+    nxt_atomic_t           processes;
+    nxt_atomic_t           idle_processes;
     uint32_t               threads;
 
     /*
@@ -179,7 +187,7 @@ struct nxt_app_s {
      * idle_ports and asserts that queue is non-empty while idle_processes
      * exceeds spare_processes.
      */
-    uint32_t               detached_processes;
+    nxt_atomic_t           detached_processes;
 
     /*
      * Application processes the router asked for, that were forked, and that
@@ -194,7 +202,7 @@ struct nxt_app_s {
      * accounted for: it announces itself late, or it dies and the router is
      * told.  See nxt_router_app_start_expired() in src/nxt_router.c.
      */
-    uint32_t               unaccounted_processes;
+    nxt_atomic_t           unaccounted_processes;
 
     uint32_t               max_processes;
     uint32_t               spare_processes;
@@ -249,6 +257,19 @@ nxt_router_app_can_start(nxt_app_t *app)
                + app->unaccounted_processes < app->max_processes
             && app->pending_processes < app->max_pending_processes;
 }
+
+
+/*
+ * Park a request in the application-wide list, and take it back out.  They
+ * live here for the same reason as the gate above: the timeout regression
+ * test calls the same functions the router calls, so a dropped membership
+ * bit cannot pass the suite.
+ */
+void nxt_router_app_request_park(nxt_app_t *app, nxt_http_request_t *r,
+    nxt_request_rpc_data_t *req_rpc_data);
+
+nxt_bool_t nxt_router_app_request_unpark(nxt_http_request_t *r,
+    nxt_request_rpc_data_t *req_rpc_data);
 
 
 typedef struct {
