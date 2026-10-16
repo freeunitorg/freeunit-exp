@@ -257,6 +257,15 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * The sink test above and this one are the two halves of the JSON access
+     * log record: nxt_utf8_sanitize_test() pins what makes a value valid UTF-8,
+     * this one pins what makes it JSON.
+     */
+    if (nxt_conf_json_escape_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_http_parse_test(thr) != NXT_OK) {
         return 1;
     }

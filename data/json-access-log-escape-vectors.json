@@ -1,0 +1,323 @@
+{
+  "$comment": "Frozen escaping vectors for the JSON access log (freeunit-exp issue 70). Data, not prose: a test reads this file and asserts own/expect/jlen per vector. Byte strings use \\\\xNN for every byte outside printable ASCII (0x20-0x7E) or where the byte is a backslash or quote. Measured against master b09815f1: nxt_conf_json_escape() (src/nxt_conf.c:2745) escapes quote, backslash and every byte <= 0x1F, and copies every other byte unchanged; nxt_utf8_sanitize() (src/nxt_utf8.c:199) replaces each byte that begins no valid UTF-8 sequence with U+FFFD before the writer sees it (src/nxt_router_access_log.c:353).",
+  "version": 1,
+  "issue": "https://github.com/freeunitorg/freeunit-exp/issues/70",
+  "base_revision": "master b09815f1",
+  "notation": {
+    "own": "sink=access-log value after nxt_utf8_sanitize() and before escaping; writer=the escaped bytes appended to the record buffer",
+    "expect": "the exact bytes the writer must append for the bytes of own",
+    "jlen": "nxt_conf_json_escape_length() for those bytes: the length of expect in bytes",
+    "hex": "\\u00XX uses UPPERCASE hex digits, as nxt_conf.c:2790 writes them"
+  },
+  "rules": [
+    {
+      "id": "R1",
+      "rule": "One JSON text, one line: a record is a single escaped JSON object followed by exactly one \\n. No value may contain a raw byte below 0x20, a raw quote or a raw backslash, so no value can move the record boundary. This is what closes the #376 forged-line class in the JSON path.",
+      "evidence": "src/nxt_router_access_log.c:353 (sanitize), src/nxt_conf.c:2745 (escape), src/nxt_router_access_log.c:376 (the trailing '\\n')"
+    },
+    {
+      "id": "R2",
+      "rule": "The escaped output is valid UTF-8 because the sink guarantees a valid UTF-8 input: the escaping layer neither validates nor repairs UTF-8. Every invalid sequence is replaced with U+FFFD (EF BF BD) by nxt_utf8_sanitize() before the writer runs. RFC 8259 Sect. 8.1 requires JSON text to be UTF-8.",
+      "evidence": "src/nxt_utf8.c:199-292, src/nxt_router_access_log.c:353"
+    },
+    {
+      "id": "R3",
+      "rule": "U+FFFD is the replacement for every invalid byte, one U+FFFD per invalid input byte, not one per maximal subpart. Worst-case expansion is therefore three output bytes per input byte and a declared record bound must be computed after sanitisation, not before.",
+      "evidence": "src/nxt_utf8.c:181-190 (the per-byte comment)"
+    },
+    {
+      "id": "R4",
+      "rule": "'/' is not escaped. RFC 8259 does not require it and escaping it only breaks naive substring consumers.",
+      "evidence": "src/nxt_conf.c:2745-2760: the only escaped bytes are '\\\\', '\"' and <= 0x1F"
+    },
+    {
+      "id": "R5",
+      "rule": "DEL (0x7F) is copied raw. It is not a JSON metacharacter and it is identical in UTF-8.",
+      "evidence": "src/nxt_conf.c:2751 (the test is ch > 0x1F)"
+    },
+    {
+      "id": "R6",
+      "rule": "The writer does not own the sink-to-writer contract: a caller that hands raw bytes to the escaper is out of contract, and no row here excuses it. The only sanctioned producer of writer input is the sink after nxt_utf8_sanitize().",
+      "evidence": "the comment at src/nxt_router_access_log.c:337-351"
+    },
+    {
+      "id": "R7",
+      "rule": "U+2028 and U+2029 are copied unchanged. RFC 8259 allows them unescaped and JSON.parse has accepted them since ES2019; only a consumer that embeds a record in a JavaScript script is affected, and that consumer should parse the line rather than eval it. If the maintainer decides to escape them anyway, the writer gains a three-byte lookahead and these three rows change with it.",
+      "evidence": "RFC 8259 Sect. 7 (unescaped = %x20-21 / %x23-5B / %x5D-10FFFF); the decision is recorded, not enforced"
+    },
+    {
+      "id": "R8",
+      "rule": "request_time: the name and the shape travel together, and a record carries one of them, never both. See numeric_field_shapes.",
+      "evidence": "src/nxt_http_variables.c:237-260; src/nxt_conf.c:2442-2444, :2330-2336"
+    }
+  ],
+  "vectors": [
+    {
+      "id": "plain-ascii",
+      "why": "the ordinary row: nothing is escaped and the copy is bulk",
+      "own": "GET /index.html HTTP/1.1",
+      "expect": "GET /index.html HTTP/1.1",
+      "jlen": 24
+    },
+    {
+      "id": "quote",
+      "why": "a quote ends the JSON string; unescaped it forges a field boundary (#376 class)",
+      "own": "a\\x22b",
+      "expect": "a\\x5c\\x22b",
+      "jlen": 4
+    },
+    {
+      "id": "backslash",
+      "why": "a backslash starts an escape sequence; unescaped it changes the decoding of the next byte",
+      "own": "a\\x5cb",
+      "expect": "a\\x5c\\x5cb",
+      "jlen": 4
+    },
+    {
+      "id": "backslash-quote",
+      "why": "the classic CVE-shaped pair: a backslash before a quote must not let the quote through",
+      "own": "\\x5c\\x22",
+      "expect": "\\x5c\\x5c\\x5c\\x22",
+      "jlen": 4
+    },
+    {
+      "id": "slash-not-escaped",
+      "why": "R4: the forward slash stays as it is, so a consumer can match a path by substring",
+      "own": "/a/b",
+      "expect": "/a/b",
+      "jlen": 4
+    },
+    {
+      "id": "named-escapes",
+      "why": "the five control bytes that have short JSON escapes; the writer must prefer the short form",
+      "own": "\\x08\\x0c\\x0a\\x0d\\x09",
+      "expect": "\\x5cb\\x5cf\\x5cn\\x5cr\\x5ct",
+      "jlen": 10
+    },
+    {
+      "id": "control-00",
+      "why": "every other byte below 0x20 is \\u00XX, including NUL",
+      "own": "\\x00",
+      "expect": "\\x5cu0000",
+      "jlen": 6
+    },
+    {
+      "id": "control-01",
+      "why": "the lowest escape the long form covers",
+      "own": "\\x01",
+      "expect": "\\x5cu0001",
+      "jlen": 6
+    },
+    {
+      "id": "control-0b",
+      "why": "vertical tab has no short JSON escape, so it takes the long form",
+      "own": "\\x0b",
+      "expect": "\\x5cu000B",
+      "jlen": 6
+    },
+    {
+      "id": "control-1f",
+      "why": "the highest byte the long form covers; uppercase hex is visible in the B",
+      "own": "\\x1f",
+      "expect": "\\x5cu001F",
+      "jlen": 6
+    },
+    {
+      "id": "del-raw",
+      "why": "R5: 0x7F is above the escape threshold and is copied unchanged",
+      "own": "\\x7f",
+      "expect": "\\x7f",
+      "jlen": 1
+    },
+    {
+      "id": "valid-2byte",
+      "why": "a valid multi-byte sequence is copied byte for byte",
+      "own": "\\xc3\\xa9",
+      "expect": "\\xc3\\xa9",
+      "jlen": 2
+    },
+    {
+      "id": "valid-4byte",
+      "why": "the astral plane, four bytes, copied unchanged by the writer",
+      "own": "\\xf0\\x9f\\x98\\x80",
+      "expect": "\\xf0\\x9f\\x98\\x80",
+      "jlen": 4
+    },
+    {
+      "id": "u2028-raw",
+      "why": "U+2028 LINE SEPARATOR is valid JSON text and is copied unchanged. It is a line terminator in JavaScript source, so a consumer that embeds a record in a script (rather than parsing it) sees a break that JSON itself does not have. Escaping it is a client-hardening decision, not a JSON requirement: the row pins the bytes so the decision is testable either way.",
+      "own": "\\xe2\\x80\\xa8",
+      "expect": "\\xe2\\x80\\xa8",
+      "jlen": 3
+    },
+    {
+      "id": "u2029-raw",
+      "why": "U+2029 PARAGRAPH SEPARATOR, same class as U+2028.",
+      "own": "\\xe2\\x80\\xa9",
+      "expect": "\\xe2\\x80\\xa9",
+      "jlen": 3
+    },
+    {
+      "id": "u2028-mixed",
+      "why": "The separators inside a value with ASCII around them, so a writer that starts escaping them must escape these and nothing else.",
+      "own": "a\\xe2\\x80\\xa8b\\xe2\\x80\\xa9c",
+      "expect": "a\\xe2\\x80\\xa8b\\xe2\\x80\\xa9c",
+      "jlen": 9
+    },
+    {
+      "id": "truncated-2byte",
+      "why": "sink: one U+FFFD for the lone lead byte; the writer then copies the three U+FFFD bytes unchanged",
+      "own": "\\xc3",
+      "expect": "\\xef\\xbf\\xbd",
+      "jlen": 3
+    },
+    {
+      "id": "truncated-4byte",
+      "why": "sink: per-byte replacement, so a truncated four-byte sequence becomes up to four U+FFFD; R3",
+      "own": "\\xf0\\x9f\\x98",
+      "expect": "\\xef\\xbf\\xbd\\xef\\xbf\\xbd\\xef\\xbf\\xbd",
+      "jlen": 9
+    },
+    {
+      "id": "lone-continuation",
+      "why": "sink: 0x80 starts no sequence on its own",
+      "own": "\\x80",
+      "expect": "\\xef\\xbf\\xbd",
+      "jlen": 3
+    },
+    {
+      "id": "lone-surrogate",
+      "why": "sink: U+D800 encoded as ED A0 80 is refused by the decoder, so three raw bytes become three U+FFFD",
+      "own": "\\xed\\xa0\\x80",
+      "expect": "\\xef\\xbf\\xbd\\xef\\xbf\\xbd\\xef\\xbf\\xbd",
+      "jlen": 9
+    },
+    {
+      "id": "overlong-2byte",
+      "why": "sink: C0 80 is an overlong NUL and is refused; 0xC0 itself is refused by nxt_utf8_decode2, so both bytes are replaced",
+      "own": "\\xc0\\x80",
+      "expect": "\\xef\\xbf\\xbd\\xef\\xbf\\xbd",
+      "jlen": 6
+    },
+    {
+      "id": "raw-high-byte-in-target",
+      "why": "#377 case: a raw 0x80-0xFF byte in a request target reaches the sink and leaves as U+FFFD, never raw",
+      "own": "/\\xff",
+      "expect": "/\\xef\\xbf\\xbd",
+      "jlen": 4
+    },
+    {
+      "id": "mixed-ascii-high-quote",
+      "why": "the three cases in one value: a copy run, a sink replacement and a writer escape",
+      "own": "a\\x22\\xffb",
+      "expect": "a\\x5c\\x22\\xef\\xbf\\xbdb",
+      "jlen": 7
+    },
+    {
+      "id": "empty",
+      "why": "the empty value is a legal JSON string",
+      "own": "",
+      "expect": "",
+      "jlen": 0
+    },
+    {
+      "id": "forged-line-request-target",
+      "why": "#376 as a vector: CR LF inside the target, plus a forged 'FAKE: LINE' header. The escaped form contains no raw CR, LF or quote, so the record stays one line",
+      "own": "/%0d%0aFAKE:%20LINE",
+      "expect": "/%0d%0aFAKE:%20LINE",
+      "jlen": 19,
+      "note": "this vector is the percent-decoded target BEFORE escaping only if the variable handler hands back raw bytes; the handler for $request_line does percent-decode, so the bytes that reach the sink are 0x0D 0x0A. Use forged-line-decoded for the byte level; this row pins that a literal percent-encoded target is not double-decoded by the writer."
+    },
+    {
+      "id": "forged-line-decoded",
+      "why": "#376 byte level: the decoded CR and LF must come out as \\r and \\n, so no consumer can see two records",
+      "own": "/\\x0d\\x0aFAKE: LINE",
+      "expect": "/\\x5cr\\x5cnFAKE: LINE",
+      "jlen": 15
+    },
+    {
+      "id": "writer-never-sees-this",
+      "why": "R6 negative vector: this is raw invalid UTF-8, the writer is not allowed to be handed it, and the row exists to catch a caller that skips the sink. The bytes 0xC3 0x28 are not a valid sequence; if a test ever feeds this to the writer directly, the sink contract has been broken and the test must fail rather than accept a record.",
+      "own": "\\xc3(",
+      "expect": null,
+      "assert": "refused-by-contract"
+    }
+  ],
+  "numeric_field_shapes": {
+    "issue": "freeunit-exp#70 D4, freeunit-exp#74",
+    "why": "request_time is the one field with a type decision behind it. Both candidate shapes are representable in nxt_conf_value_t today, and the choice changes what a consumer reads, so both are frozen here as data, not as prose.",
+    "measured_from": "src/nxt_http_variables.c:237-260 and src/nxt_conf.c:2442-2444 at 08c3b866",
+    "source_fact": "nxt_http_var_request_time() computes integer milliseconds (ms = (now - start_time) / 1000000) and prints seconds with three decimals via %T.%03M, so the integer shape loses nothing against the source and both shapes are exact for every value the text form can print.",
+    "shapes": [
+      {
+        "name": "integer-milliseconds",
+        "field": "request_time_ms",
+        "json_type": "integer",
+        "mechanism": "nxt_conf_set_member_integer(), already public (src/nxt_conf.h:170)",
+        "new_api_needed": false,
+        "looks_like": {
+          "0": 0,
+          "41": 41,
+          "999": 999,
+          "1000": 1000,
+          "60000": 60000,
+          "3600000": 3600000
+        },
+        "breaks": "anything that read the old text field as seconds; a bare 41 in a field named request_time is the silent case, which is why the unit belongs in the name"
+      },
+      {
+        "name": "decimal-seconds",
+        "field": "request_time",
+        "json_type": "number",
+        "mechanism": "NXT_CONF_VALUE_NUMBER prints its stored text verbatim (src/nxt_conf.c:2442-2444), but there is no public setter: the parser is the only producer (src/nxt_conf.c:2330-2336)",
+        "new_api_needed": true,
+        "looks_like": {
+          "0": 0.0,
+          "41": 0.041,
+          "999": 0.999,
+          "1000": 1.0,
+          "60000": 60.0,
+          "3600000": 3600.0
+        },
+        "breaks": "nothing, if the name and the fraction stay; it is what the text format already prints, so an existing consumer keeps working"
+      }
+    ],
+    "rule": "Freeze exactly one. A record must never carry both, and the field name must match the shape: request_time_ms is an integer, request_time is decimal seconds. A test that accepts either shape accepts the ambiguity the name exists to remove.",
+    "measured_on": "o-build (aarch64 Alpine, gcc 15.2.0), against build/lib/libnxt.a from the tree configured at 08c3b866",
+    "measured_result": {
+      "method": "exp/request_time_shapes.c built against build/lib/libnxt.a; the integer shape via nxt_conf_set_member_integer(), the decimal shape via nxt_conf_json_parse() on the exact text the format prints",
+      "table_ms_to_integer_to_decimal": {
+        "0": [
+          "{\"v\":0}",
+          "0.000"
+        ],
+        "41": [
+          "{\"v\":41}",
+          "0.041"
+        ],
+        "999": [
+          "{\"v\":999}",
+          "0.999"
+        ],
+        "1000": [
+          "{\"v\":1000}",
+          "1.000"
+        ],
+        "60000": [
+          "{\"v\":60000}",
+          "60.000"
+        ],
+        "3600000": [
+          "{\"v\":3600000}",
+          "3600.000"
+        ]
+      },
+      "findings": [
+        "Both shapes are valid JSON numbers and the parser accepts every value measured, including 3600.000; no length limit bites at these widths (NXT_CONF_MAX_NUMBER_LEN is 14).",
+        "The decimal shape reproduces the digits the current format already prints, so an existing consumer that treats the field as seconds keeps working; it must parse a number rather than a string.",
+        "The integer shape is the same instant named differently: 41 against 0.041. A consumer that assumed seconds reads 41 seconds, which is why the unit belongs in the field name.",
+        "NXT_CONF_VALUE_INTEGER has a public setter (nxt_conf_set_member_integer); NXT_CONF_VALUE_NUMBER has none, so the decimal shape needs a new setter while the integer shape does not."
+      ]
+    }
+  }
+}
