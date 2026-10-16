@@ -347,13 +347,13 @@ ssize_t nxt_event_conn_io_send(nxt_conn_t *c, void *buf, size_t size);
         if (c->idle != NXT_CONN_TRACK_IDLE) {                                 \
             if (c->idle == NXT_CONN_TRACK_ACTIVE) {                           \
                 nxt_queue_remove(&c->link);                                   \
-                e->active_conns_cnt--;                                        \
+                nxt_atomic_fetch_add(&e->active_conns_cnt, -1);                \
             }                                                                 \
                                                                               \
             nxt_queue_insert_head(&e->idle_connections, &c->link);           \
                                                                               \
             c->idle = NXT_CONN_TRACK_IDLE;                                    \
-            e->idle_conns_cnt++;                                              \
+            nxt_atomic_fetch_add(&e->idle_conns_cnt, 1);                      \
         }                                                                     \
     } while (0)
 
@@ -379,12 +379,12 @@ ssize_t nxt_event_conn_io_send(nxt_conn_t *c, void *buf, size_t size);
                                                                               \
         if (c->idle == NXT_CONN_TRACK_IDLE) {                                 \
             nxt_queue_remove(&c->link);                                       \
-            e->idle_conns_cnt--;                                              \
+            nxt_atomic_fetch_add(&e->idle_conns_cnt, -1);                     \
                                                                               \
             nxt_queue_insert_head(&e->active_connections, &c->link);         \
                                                                               \
             c->idle = NXT_CONN_TRACK_ACTIVE;                                  \
-            e->active_conns_cnt++;                                            \
+            nxt_atomic_fetch_add(&e->active_conns_cnt, 1);                    \
         }                                                                     \
     } while (0)
 
@@ -411,14 +411,14 @@ ssize_t nxt_event_conn_io_send(nxt_conn_t *c, void *buf, size_t size);
             nxt_queue_remove(&c->link);                                       \
                                                                               \
             if (c->idle == NXT_CONN_TRACK_IDLE) {                             \
-                e->idle_conns_cnt--;                                          \
+                nxt_atomic_fetch_add(&e->idle_conns_cnt, -1);                 \
                                                                               \
             } else {                                                          \
-                e->active_conns_cnt--;                                        \
+                nxt_atomic_fetch_add(&e->active_conns_cnt, -1);               \
             }                                                                 \
                                                                               \
             c->idle = NXT_CONN_TRACK_NONE;                                    \
-            e->closed_conns_cnt++;                                            \
+            nxt_atomic_fetch_add(&e->closed_conns_cnt, 1);                    \
         }                                                                     \
     } while (0)
 

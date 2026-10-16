@@ -281,7 +281,7 @@ nxt_http_request_create(nxt_task_t *task)
 
     r->start_time = nxt_thread_monotonic_time(task->thread);
 
-    task->thread->engine->requests_cnt++;
+    nxt_atomic_fetch_add(&task->thread->engine->requests_cnt, 1);
 
     r->tstr_cache.var.pool = mp;
 

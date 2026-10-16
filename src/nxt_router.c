@@ -2174,10 +2174,10 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_queue_each(engine, &nxt_router->engines, nxt_event_engine_t, link0) {
 
-        report->accepted_conns += engine->accepted_conns_cnt;
-        report->idle_conns += engine->idle_conns_cnt;
-        report->closed_conns += engine->closed_conns_cnt;
-        report->requests += engine->requests_cnt;
+        report->accepted_conns += nxt_atomic_load(&engine->accepted_conns_cnt);
+        report->idle_conns += nxt_atomic_load(&engine->idle_conns_cnt);
+        report->closed_conns += nxt_atomic_load(&engine->closed_conns_cnt);
+        report->requests += nxt_atomic_load(&engine->requests_cnt);
 
     } nxt_queue_loop;
 
@@ -2399,10 +2399,12 @@ nxt_router_test_temp_conf(nxt_task_t *task)
 nxt_inline nxt_bool_t
 nxt_router_app_need_start(nxt_app_t *app)
 {
-    return (app->active_requests
-              > app->port_hash_count + app->pending_processes)
+    return (nxt_atomic_load(&app->active_requests)
+              > nxt_atomic_load(&app->port_hash_count)
+                + nxt_atomic_load(&app->pending_processes))
            || (app->spare_processes
-                > app->idle_processes + app->pending_processes);
+                > nxt_atomic_load(&app->idle_processes)
+                  + nxt_atomic_load(&app->pending_processes));
 }
 
 
