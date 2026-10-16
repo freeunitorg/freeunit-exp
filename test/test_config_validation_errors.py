@@ -12,6 +12,7 @@ language SAPI module configured.
 """
 
 from unit import port as port_map
+from unit.check.check_prerequisites import check_prerequisites
 from unit.control import Control
 
 client = Control()
@@ -211,3 +212,28 @@ def test_backward_compat_error_shape_preserved():
     assert 'success' not in r
     # Legacy message wording preserved verbatim.
     assert r['detail'] == 'Unknown parameter "foo".'
+
+
+def test_php_option_integer_is_refused_as_string():
+    # Claim A of freeunit-exp#6, src/nxt_conf_validation.c
+    # (nxt_conf_vldt_php_option): PHP option values under
+    # options.admin and options.user are string-only by design, and
+    # the error names the key. One integer beside the claim B
+    # assertion above pins it. Needs a built PHP module: without one
+    # the controller reports the missing module before validation
+    # reaches the option, so this skips instead of failing there.
+    check_prerequisites({'modules': {'php': 'any'}})
+    r = _put(
+        {
+            "applications": {
+                "d": {
+                    "type": "php",
+                    "root": "/tmp",
+                    "options": {"admin": {"opcache.enable": 1}},
+                }
+            }
+        }
+    )
+    assert 'error' in r
+    assert 'success' not in r
+    assert r['detail'] == 'The "opcache.enable" PHP option must be a string.'
