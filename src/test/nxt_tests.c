@@ -74,10 +74,12 @@ nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
 static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_checked_test, nxt_port_mmap_read_test,
     nxt_router_response_parse_test, nxt_port_frag_test,
-    nxt_port_release_test, nxt_nncq_bound_test, nxt_size_bound_test,
+    nxt_port_release_test, nxt_nncq_bound_test, nxt_nncq_wrap_test,
+    nxt_app_queue_test, nxt_size_bound_test, nxt_mp_cluster_cache_test,
 #if (NXT_HAVE_REGEX)
     nxt_regex_test,
 #endif
+    nxt_usdt_test,
 };
 
 
@@ -409,6 +411,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_engine_port_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_main_start_process_reply_test(thr) != NXT_OK) {
         return 1;
     }
@@ -454,6 +460,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_port_queued_fd_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_doorbell_test(thr) != NXT_OK) {
         return 1;
     }
 

@@ -12,13 +12,15 @@
 # with debug information.  Then it runs pahole on each struct and compares
 # the two results.  For a "shm" struct, pahole also shows the layout of
 # the structs in it.  For a "const" macro, a small program that is built
-# with the headers of the commit prints the value.
+# with the headers of the commit prints its value in each geometry arm;
+# the same program prints the value of each "enum" constant.
 #
 #   - A change to a "shm" struct fails.  Processes that are built from
 #     different commits share these structs, so the change breaks the ABI
 #     between them.  If the change is necessary, explain it in the pull
 #     request.
-#   - A change to a "const" value fails, for the same reason.
+#   - A change to a "const" value or an "enum" constant fails, for the
+#     same reason.
 #   - A change to a "local" struct gives a warning.
 #   - An entry that is in the BASE list and not in the HEAD list fails.
 #     A "shm" or "const" entry with an other kind in the HEAD list also
@@ -27,6 +29,12 @@
 #     a "const" macro that the HEAD headers do not define.
 #   - A "shm" struct with a different layout in unitd and in nxt_unit.o of
 #     the HEAD build fails.
+#
+# The list must also cover every struct defined in a header that "make
+# install" copies: a module is built against those headers and lays the
+# struct out itself, so a change to one of them is as silent as a change to
+# a shared struct.  tools/perf/layout-coverage.py checks that half, and the
+# layout job runs it before this comparison.
 #
 # Exit status: 0 if the check passes, 1 if a layout check fails, 2 for an
 # error of the check itself (a bad argument, a bad line in the list, a
@@ -68,7 +76,7 @@ list() {
     git show "$1:$LIST" | awk -v file="$1:$LIST" '
         { sub(/#.*/, "") }
         NF == 0 { next }
-        NF != 2 || ($1 != "shm" && $1 != "local" && $1 != "const") || seen[$2]++ {
+        NF != 2 || ($1 != "shm" && $1 != "local" && $1 != "const" && $1 != "enum") || seen[$2]++ {
             print "::error::" file ": bad line: " $0 > "/dev/stderr"
             exit 2
         }
@@ -76,10 +84,12 @@ list() {
 }
 
 
-# build COMMIT DIR: build unitd and nxt_unit.o of COMMIT in DIR.  Then
+# build COMMIT DIR LIST: build unitd and nxt_unit.o of COMMIT in DIR.  Then
 # build and run a program that prints the "const" values of the HEAD list
-# with the headers of COMMIT, to DIR.const.  A macro that the headers do
-# not define is not printed.
+# with the headers of COMMIT, to DIR.const.  The geometry macros have a
+# definition in each NXT_MMAP_TINY_CHUNK arm, so the program is built
+# twice, and each value is tagged with its arm.  A macro that an arm does
+# not define prints no line for it.
 
 build() {
     echo "build $1"
@@ -101,6 +111,9 @@ build() {
     {
         echo '#include <nxt_main.h>'
         echo '#include <nxt_port_memory_int.h>'
+        echo '#include <nxt_unit.h>'
+        echo '#include <nxt_unit_field.h>'
+        echo '#include <nxt_websocket_header.h>'
         echo '#include <stdio.h>'
         echo 'int main(void) {'
         awk '$1 == "const" {
@@ -108,14 +121,46 @@ build() {
             printf "printf(\"%%s %%llu\\n\", \"%s\", ", $2
             printf "(unsigned long long) (%s));\n#endif\n", $2
         }' "$work/head.list"
+        # An enum constant is not a macro, so #ifdef cannot test it.  The
+        # constants come from the list of COMMIT (and the HEAD list), so a
+        # constant that COMMIT does not have is not compiled in, and is
+        # reported as not in that build.
+        awk 'NR == FNR { if ($1 == "enum") want[$2] = 1; next }
+             $1 == "enum" && want[$2] {
+            printf "printf(\"%%s %%llu\\n\", \"%s\", ", $2
+            printf "(unsigned long long) (%s));\n", $2
+        }' "$3" "$work/head.list"
         echo 'return 0; }'
     } > "$2/layout_const.c"
 
     (cd "$2" && "${CC:-cc}" -funsigned-char -std=gnu11 -I src -I build/include \
-         -o layout_const layout_const.c && ./layout_const) \
+         -o layout_const layout_const.c \
+         && ./layout_const | sed 's/^/default /') \
         > "$2.const" 2> "$2.log" || {
         cat "$2.log"
-        echo "error: the const program of $1 failed" >&2
+        echo "error: the const program of $1 (default) failed" >&2
+        exit 2
+    }
+
+    # The tiny arm is a separate compilation: a macro definition chosen by
+    # #ifdef NXT_MMAP_TINY_CHUNK is not reached in the build above, so a
+    # change to it would otherwise read as "same" here.
+    #
+    # The pipe to sed hides the exit status of the program: a program that
+    # dies after printing some lines is not reported here, and the missing
+    # value is then reported as "is not in the build of the head commit".
+    # A macro that the headers do not define prints no line for it, and a
+    # macro that is defined but is not a value is a compile error.
+    #
+    # The log is appended to, not truncated, as in the build above, so
+    # that no compiler output of this function is discarded.
+    (cd "$2" && "${CC:-cc}" -funsigned-char -std=gnu11 -DNXT_MMAP_TINY_CHUNK \
+         -I src -I build/include \
+         -o layout_const layout_const.c \
+         && ./layout_const | sed 's/^/tiny /') \
+        >> "$2.const" 2>> "$2.log" || {
+        cat "$2.log"
+        echo "error: the const program of $1 (tiny) failed" >&2
         exit 2
     }
 }
@@ -131,8 +176,12 @@ build() {
 # an application that uses libunit share it.
 
 layout() {
-    if [ "$2" = const ]; then
-        awk -v name="$3" '$1 == name' "$1.const"
+    if [ "$2" = const ] || [ "$2" = enum ]; then
+        # DIR.const holds "<arm> <name> <value>" lines for both arms, so
+        # both are returned for the macro: the comparison below then sees
+        # a change to either the default or the tiny geometry.  The name
+        # is in the second field, because the arm tag is the first.
+        awk -v name="$3" '$2 == name' "$1.const"
         return
     fi
 
@@ -179,8 +228,8 @@ echo "head: $(git log -1 --format='%h %s' "$head")"
 "${CC:-cc}" --version | head -n 1
 "$PAHOLE" --version
 
-build "$base" "$work/base"
-build "$head" "$work/head"
+build "$base" "$work/base" "$work/base.list"
+build "$head" "$work/head" "$work/head.list"
 
 fail=
 warn=
@@ -212,7 +261,7 @@ while read -r kind name <&3; do
             "$work/old" "$work/new" || true
 
         case $kind in
-            shm|const) fail="$fail $name" ;;
+            shm|const|enum) fail="$fail $name" ;;
             *)   warn="$warn $name" ;;
         esac
     fi

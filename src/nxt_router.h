@@ -170,6 +170,7 @@ struct nxt_app_s {
     uint32_t               pending_processes;
     uint32_t               processes;
     uint32_t               idle_processes;
+    uint32_t               threads;
 
     /*
      * Workers that answered a request and kept running.  Counted in
@@ -412,6 +413,13 @@ void nxt_router_test_listen_socket_update(nxt_task_t *task,
 /* The request deadline handler, for the app-timeout test. */
 void nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data);
 
+/*
+ * A request RPC with the router's response handlers, for the app-timeout
+ * test.  The result is an nxt_request_rpc_data_t.
+ */
+void *nxt_router_test_request_rpc_register(nxt_task_t *task,
+    nxt_port_t *port);
+
 /* The application response decoder, for the response parse test. */
 nxt_int_t nxt_router_test_response_header_parse(nxt_task_t *task,
     nxt_http_request_t *r, nxt_buf_t *b);
@@ -423,6 +431,10 @@ nxt_int_t nxt_router_test_response_header_parse(nxt_task_t *task,
  */
 nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_app_t *app, nxt_uint_t *status);
+
+/* The engine thread start, for the engine port test. */
+nxt_int_t nxt_router_test_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_event_engine_t *engine);
 #endif
 
 

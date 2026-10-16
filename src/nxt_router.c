@@ -24,6 +24,7 @@
 #include <nxt_span.h>
 #include <nxt_checked.h>
 #include <nxt_http_compression.h>
+#include <nxt_usdt.h>
 
 #if (NXT_HAVE_OTEL)
 #define NXT_OTEL_BATCH_DEFAULT     128
@@ -35,6 +36,7 @@ typedef struct {
     uint32_t          processes;
     uint32_t          max_processes;
     uint32_t          spare_processes;
+    uint32_t          threads;
     nxt_msec_t        timeout;
     nxt_msec_t        idle_timeout;
     nxt_conf_value_t  *limits_value;
@@ -335,9 +337,9 @@ static void nxt_router_engines_post(nxt_router_t *router,
 static void nxt_router_engine_post(nxt_event_engine_t *engine,
     nxt_work_t *jobs);
 
+static nxt_port_t *nxt_router_engine_port_create(nxt_task_t *task,
+    nxt_runtime_t *rt);
 static void nxt_router_thread_start(void *data);
-static void nxt_router_rt_add_port(nxt_task_t *task, void *obj,
-    void *data);
 static void nxt_router_listen_socket_create(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_listen_socket_update(nxt_task_t *task, void *obj,
@@ -1357,6 +1359,9 @@ nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
                                  req_rpc_data->stream))
         {
             msg_info->cancel = NXT_MSG_RETRACTED;
+
+            NXT_USDT(queue__cancel, msg_info->tracking_cookie,
+                     req_rpc_data->stream);
 
             nxt_debug(task, "stream #%uD: cancelled by router",
                       req_rpc_data->stream);
@@ -2715,6 +2720,12 @@ static nxt_conf_map_t  nxt_router_app_conf[] = {
     },
 
     {
+        nxt_string("threads"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_router_app_conf_t, threads),
+    },
+
+    {
         nxt_string("targets"),
         NXT_CONF_MAP_PTR,
         offsetof(nxt_router_app_conf_t, targets_value),
@@ -3177,6 +3188,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             apcf.processes = 1;
             apcf.max_processes = 1;
             apcf.spare_processes = 0;
+            apcf.threads = 1;
             apcf.timeout = 0;
             apcf.start_timeout = NXT_APP_START_TIMEOUT;
             apcf.idle_timeout = 15000;
@@ -3285,6 +3297,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             app->type = lang->type;
             app->max_processes = apcf.max_processes;
             app->spare_processes = apcf.spare_processes;
+            app->threads = nxt_max(apcf.threads, 1);
             app->max_pending_processes = apcf.spare_processes
                                          ? apcf.spare_processes : 1;
             app->timeout = apcf.timeout;
@@ -5072,6 +5085,7 @@ nxt_router_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
     nxt_event_engine_t *engine)
 {
     nxt_int_t            ret;
+    nxt_port_t           *port;
     nxt_thread_link_t    *link;
     nxt_thread_handle_t  handle;
 
@@ -5080,6 +5094,30 @@ nxt_router_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
     if (nxt_slow_path(link == NULL)) {
         return NXT_ERROR;
     }
+
+    /*
+     * The port of the engine goes into rt->ports here, on the main thread,
+     * before the engine thread exists.  The engine sends requests to
+     * applications with this port as the reply port, and libunit asks the
+     * main thread for it with GET_PORT (nxt_router_get_port_handler()).  If
+     * the engine thread published the port itself, it would post the work to
+     * the main thread and start to accept connections at once.  A GET_PORT
+     * read in the same poll as that post is handled first, finds no port and
+     * gets no reply, and the request then waits for ever.
+     */
+    port = nxt_router_engine_port_create(task, rt);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_free(link);
+        return NXT_ERROR;
+    }
+
+    /*
+     * The main thread can post to the port before the engine thread starts,
+     * see nxt_router_remove_pid_handler().  The work waits in the queue of
+     * the engine.  nxt_port_enable() sets the same engine again.
+     */
+    port->engine = engine;
+    engine->port = port;
 
     link->start = nxt_router_thread_start;
     link->engine = engine;
@@ -5093,10 +5131,82 @@ nxt_router_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
 
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_queue_remove(&engine->link);
+
+        engine->port = NULL;
+
+        /* No engine thread runs, so the last release must happen here. */
+        port->engine = NULL;
+
+        nxt_port_close(task, port);
+
+        /* This drops the hash reference. */
+        nxt_runtime_port_remove(task, port);
+
+        /* This drops the reference from nxt_port_new(). */
+        nxt_port_use(task, port, -1);
     }
 
     return ret;
 }
+
+
+/*
+ * Creates the port of a new engine and adds it to rt->ports.  The reference
+ * from nxt_port_new() belongs to the engine.  The hash takes one more.
+ * nxt_runtime_port_remove() drops the hash reference, and an explicit
+ * nxt_port_use(-1) drops the engine reference.
+ */
+
+static nxt_port_t *
+nxt_router_engine_port_create(nxt_task_t *task, nxt_runtime_t *rt)
+{
+    nxt_int_t   ret;
+    nxt_port_t  *port;
+
+    port = nxt_port_new(task, nxt_port_get_next_id(), nxt_pid,
+                        NXT_PROCESS_ROUTER);
+    if (nxt_slow_path(port == NULL)) {
+        return NULL;
+    }
+
+    ret = nxt_port_socket_init(task, port, 0);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_use(task, port, -1);
+        return NULL;
+    }
+
+    ret = nxt_router_port_queue_init(task, port);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_close(task, port);
+        nxt_port_use(task, port, -1);
+        return NULL;
+    }
+
+    ret = nxt_port_hash_add(&rt->ports, port);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_close(task, port);
+        nxt_port_use(task, port, -1);
+        return NULL;
+    }
+
+    nxt_port_use(task, port, 1);
+
+    return port;
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_engine_port_test.c. */
+
+nxt_int_t
+nxt_router_test_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_event_engine_t *engine)
+{
+    return nxt_router_thread_create(task, rt, engine);
+}
+
+#endif
 
 
 static void
@@ -5175,10 +5285,8 @@ static nxt_port_handlers_t  nxt_router_app_port_handlers = {
 static void
 nxt_router_thread_start(void *data)
 {
-    nxt_int_t           ret;
     nxt_port_t          *port;
     nxt_task_t          *task;
-    nxt_work_t          *work;
     nxt_thread_t        *thread;
     nxt_thread_link_t   *link;
     nxt_event_engine_t  *engine;
@@ -5204,61 +5312,19 @@ nxt_router_thread_start(void *data)
         return;
     }
 
-    port = nxt_port_new(task, nxt_port_get_next_id(), nxt_pid,
-                        NXT_PROCESS_ROUTER);
-    if (nxt_slow_path(port == NULL)) {
-        return;
-    }
+    /*
+     * The main thread created the port and added it to rt->ports in
+     * nxt_router_thread_create().  This thread reads it from now on.
+     */
+    port = engine->port;
 
-    ret = nxt_port_socket_init(task, port, 0);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        nxt_port_use(task, port, -1);
-        return;
-    }
+    nxt_mp_thread_adopt(port->mem_pool);
 
-    ret = nxt_router_port_queue_init(task, port);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        nxt_port_use(task, port, -1);
-        return;
-    }
-
-    engine->port = port;
+    port->socket.task = task;
 
     nxt_port_enable(task, port, &nxt_router_app_port_handlers);
 
-    work = nxt_zalloc(sizeof(nxt_work_t));
-    if (nxt_slow_path(work == NULL)) {
-        return;
-    }
-
-    work->handler = nxt_router_rt_add_port;
-    work->task = link->work.task;
-    work->obj = work;
-    work->data = port;
-
-    nxt_event_engine_post(link->work.task->thread->engine, work);
-
     nxt_event_engine_start(engine);
-}
-
-
-static void
-nxt_router_rt_add_port(nxt_task_t *task, void *obj, void *data)
-{
-    nxt_int_t      res;
-    nxt_port_t     *port;
-    nxt_runtime_t  *rt;
-
-    rt = task->thread->runtime;
-    port = data;
-
-    nxt_free(obj);
-
-    res = nxt_port_hash_add(&rt->ports, port);
-
-    if (nxt_fast_path(res == NXT_OK)) {
-        nxt_port_use(task, port, 1);
-    }
 }
 
 
@@ -5569,8 +5635,9 @@ nxt_router_worker_thread_exit(nxt_task_t *task)
 {
     /*
      * Free per-thread caches whose storage lives in this thread and can only
-     * be released while running on it, then leave the thread.  New worker-exit
-     * paths must route through here so the cleanup is never forgotten.
+     * be released while running on it, then leave the thread.  The pool
+     * cluster cache is freed in nxt_thread_exit().  New worker-exit paths must
+     * route through here so the cleanup is never forgotten.
      */
     nxt_http_static_buf_freelist_drain();
 
@@ -5966,11 +6033,13 @@ nxt_router_thread_exit_handler(nxt_task_t *task, void *obj, void *data)
 
     /*
      * The worker thread is gone, so nothing reads port->pair[0] any more:
-     * close the socket pair and the queue memfd, and drop the reference
-     * nxt_router_rt_add_port() took when it published the port in
-     * rt->ports.  Without this every engine removed by a listen_threads
-     * decrease leaks 3 descriptors (2 socketpair + 1 memfd) for the
-     * router's lifetime.
+     * close the socket pair and the queue memfd.  Without this every engine
+     * removed by a listen_threads decrease leaks 3 descriptors (2 socketpair
+     * + 1 memfd) for the router's lifetime.
+     *
+     * nxt_runtime_port_remove() drops the reference that
+     * nxt_router_engine_port_create() took for rt->ports.  The explicit
+     * drop after it is the engine reference from nxt_port_new().
      */
     nxt_port_close(task, port);
     nxt_runtime_port_remove(task, port);
@@ -7717,7 +7786,8 @@ void
 nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 {
     nxt_app_t   *app;
-    nxt_bool_t  unchain, start_process, detached;
+    nxt_port_t  *shared_port;
+    nxt_bool_t  unchain, start_process, detached, rearm;
 
     app = port->app;
 
@@ -7795,6 +7865,18 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
         app->pending_processes++;
     }
 
+    rearm = 0;
+    shared_port = app->shared_port;
+    if (shared_port != NULL) {
+        nxt_port_use(task, shared_port, 1);
+
+        if (shared_port->queue != NULL
+            && nxt_app_queue_depth(shared_port->queue) > 0)
+        {
+            rearm = 1;
+        }
+    }
+
     nxt_thread_mutex_unlock(&app->mutex);
 
     nxt_debug(task, "app '%V' pid %PI closed", &app->name, port->pid);
@@ -7805,6 +7887,16 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 
     if (start_process) {
         nxt_router_start_app_process(task, app);
+    }
+
+    if (shared_port != NULL) {
+        if (rearm) {
+            (void) nxt_port_socket_write(task, shared_port,
+                                         NXT_PORT_MSG_READ_QUEUE,
+                                         -1, 0, 0, NULL);
+        }
+
+        nxt_port_use(task, shared_port, -1);
     }
 
     /*
@@ -8257,6 +8349,8 @@ static void
 nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data)
 {
+    size_t             workers;
+    uint32_t           bound, readers;
     nxt_app_t          *app;
     nxt_buf_t          *buf, *body;
     nxt_int_t          res;
@@ -8322,10 +8416,49 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     msg.mm.chunk_id = nxt_port_mmap_chunk_id(hdr, buf->mem.pos);
     msg.mm.size = nxt_buf_used_size(buf);
 
-    res = nxt_app_queue_send(port->queue, &msg, sizeof(msg),
-                             req_rpc_data->stream, &notify,
-                             &req_rpc_data->msg_info.tracking_cookie);
+    if (nxt_slow_path(nxt_size_mul(nxt_max(app->processes, 1),
+                                   nxt_max(app->threads, 1), &workers)
+                      != 0 || workers > UINT32_MAX))
+    {
+        bound = UINT32_MAX;
+    } else {
+        bound = (uint32_t) workers;
+    }
+
+    /*
+     * Every registered context reads the shared queue, and an "external"
+     * application allocates contexts of its own (nxt_unit_ctx_alloc(),
+     * one NEW_PORT each) with no "threads" setting to say so.
+     * ->port_hash_count counts each process's main port and each context
+     * port the router registered, so it is the number of queue readers
+     * whenever it exceeds processes * threads.
+     */
+    nxt_thread_mutex_lock(&app->mutex);
+    readers = app->port_hash_count;
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    bound = nxt_max(bound, readers);
+
+    res = nxt_app_queue_send_bound(port->queue, &msg, sizeof(msg),
+                                   req_rpc_data->stream, &notify,
+                                   &req_rpc_data->msg_info.tracking_cookie,
+                                   bound);
     if (nxt_fast_path(res == NXT_OK)) {
+        /*
+         * The shared port carries nothing but READ_QUEUE (a worker's own
+         * port carries other messages too, so it is left alone).  While its
+         * socket is full or messages already wait for it, the workers have
+         * unread doorbells, so another one wakes nobody new; queueing it
+         * would only grow port->messages without bound while busy workers
+         * keep dequeuing ahead of their doorbells.
+         */
+        if (notify != 0 && port->id == NXT_SHARED_PORT_ID
+            && nxt_port_socket_backlogged(port))
+        {
+            nxt_debug(task, "shared port backlogged, doorbell skipped");
+            notify = 0;
+        }
+
         if (notify != 0) {
             (void) nxt_port_socket_write(task, port,
                                          NXT_PORT_MSG_READ_QUEUE,
@@ -8333,6 +8466,16 @@ nxt_router_app_prepare_request(nxt_task_t *task,
                                          reply_port->id, NULL);
 
         } else {
+            /*
+             * No doorbell: the item landed at or beyond depth_bound, or the
+             * shared port is backlogged (above), so enough READ_QUEUE
+             * datagrams are already outstanding to wake every reader, and a
+             * worker re-checks the queue after each one.  The probe counts
+             * these against queue__enqueue.
+             */
+            NXT_USDT(queue__no_doorbell, req_rpc_data->msg_info.tracking_cookie,
+                     req_rpc_data->stream);
+
             nxt_debug(task, "queue is not empty");
         }
 
@@ -8745,13 +8888,36 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
      * would both fail the request and run it -- twice, if the client
      * retries.
      *
-     * Leave a claimed request alone until its acknowledgement, and do not
-     * re-arm: the acknowledgement arms this timer again.  Do not answer it
-     * at a later expiry either.  The chain's tail is the request body that
-     * nxt_router_req_headers_ack_handler() still has to send, and libunit
-     * keeps the request until that body arrives.  An unlink here would drop
-     * the body and cancel the RPC, so a late acknowledgement is ignored and
-     * the request stays in the worker for ever.
+     * Do not answer a claimed request at its first expiry.  The chain's
+     * tail is the request body that nxt_router_req_headers_ack_handler()
+     * still has to send, and libunit keeps the request until that body
+     * arrives.  An unlink drops that body.
+     *
+     * The acknowledgement usually comes within microseconds of the claim.
+     * A whole timeout without it means that the worker failed or died
+     * before it sent one.  Log an alert, because nothing else reports this
+     * state, and re-arm the timer.  The acknowledgement replaces the timer
+     * with its own deadline.
+     *
+     * At the second expiry, answer 503 and unlink, as for a request that a
+     * worker acknowledged and runs too long.  The unlink cancels the RPC.
+     * A late acknowledgement or response then finds no handler in
+     * nxt_port_rpc_handler() and is dropped.  The port layer completes the
+     * buffers of a message that no handler took.
+     *
+     * The router cannot mark the worker detached, as nxt_router_app_abandon()
+     * does for an acknowledged request.  The request is still on the shared
+     * port, and the router does not know which worker claimed it.
+     *
+     * A worker that does get the request after the 503 can still run it.  If
+     * the body did not fit in the headers message, the worker waits for a
+     * body that does not come.  The next QUIT from the router has no
+     * parameter, so libunit fails every active request then
+     * (nxt_unit_quit()).
+     *
+     * The unlink leaves the shared memory of the headers to the worker:
+     * nxt_router_msg_cancel() keeps ->is_port_mmap_sent, because the
+     * retraction lost.
      *
      * The acknowledgement replaces ->app_port with the worker's own port, so
      * the shared port here means that it has not arrived yet.
@@ -8765,10 +8931,27 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
         && req_rpc_data->app_port != NULL
         && req_rpc_data->app_port->id == NXT_SHARED_PORT_ID)
     {
-        nxt_debug(task, "stream #%uD: claimed, waiting for the ack",
-                  req_rpc_data->stream);
+        /* The request is still linked, so it holds the application. */
+        nxt_assert(req_rpc_data->app != NULL);
 
-        return;
+        if (req_rpc_data->claimed_expired == 0) {
+            req_rpc_data->claimed_expired = 1;
+
+            nxt_alert(task, "app \"%V\": stream #%uD was claimed by a worker, "
+                      "and the %M ms deadline expired without an "
+                      "acknowledgement",
+                      &req_rpc_data->app->name, req_rpc_data->stream,
+                      req_rpc_data->app->timeout);
+
+            nxt_timer_add(task->thread->engine, timer,
+                          req_rpc_data->app->timeout);
+
+            return;
+        }
+
+        nxt_log(task, NXT_LOG_WARN, "app \"%V\": stream #%uD is still not "
+                "acknowledged, answering 503", &req_rpc_data->app->name,
+                req_rpc_data->stream);
     }
 
     /*
@@ -8825,6 +9008,25 @@ nxt_router_http_request_release(nxt_task_t *task, void *obj, void *data)
 
     nxt_mp_release(r->mem_pool);
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * A request RPC with the handlers that nxt_router_process_http_request()
+ * registers, for src/test/nxt_router_app_timeout_test.c.
+ */
+
+void *
+nxt_router_test_request_rpc_register(nxt_task_t *task, nxt_port_t *port)
+{
+    return nxt_port_rpc_register_handler_ex(task, port,
+                                            nxt_router_response_ready_handler,
+                                            nxt_router_response_error_handler,
+                                            sizeof(nxt_request_rpc_data_t));
+}
+
+#endif
 
 
 /*
