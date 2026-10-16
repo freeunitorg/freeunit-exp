@@ -164,12 +164,19 @@ struct nxt_app_s {
 
     nxt_str_t              name;
 
-    uint32_t               port_hash_count;
+    /*
+     * The accounting counters are atomics.  The start gate reads them from
+     * every router thread without the application lock, and the config-apply
+     * prefork path updates some of them without that lock too.  The lock
+     * still serializes the port set and the queue transitions the counters
+     * describe.
+     */
+    nxt_atomic_t           port_hash_count;
 
-    uint32_t               active_requests;
-    uint32_t               pending_processes;
-    uint32_t               processes;
-    uint32_t               idle_processes;
+    nxt_atomic_t           active_requests;
+    nxt_atomic_t           pending_processes;
+    nxt_atomic_t           processes;
+    nxt_atomic_t           idle_processes;
     uint32_t               threads;
 
     /*
@@ -179,7 +186,7 @@ struct nxt_app_s {
      * idle_ports and asserts that queue is non-empty while idle_processes
      * exceeds spare_processes.
      */
-    uint32_t               detached_processes;
+    nxt_atomic_t           detached_processes;
 
     /*
      * Application processes the router asked for, that were forked, and that
@@ -194,7 +201,7 @@ struct nxt_app_s {
      * accounted for: it announces itself late, or it dies and the router is
      * told.  See nxt_router_app_start_expired() in src/nxt_router.c.
      */
-    uint32_t               unaccounted_processes;
+    nxt_atomic_t           unaccounted_processes;
 
     uint32_t               max_processes;
     uint32_t               spare_processes;
