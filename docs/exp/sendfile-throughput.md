@@ -74,6 +74,45 @@ size threshold in `nxt_http_static_sendfile()` — send a file buffer at or abov
 loss. That threshold should still be confirmed at 2 and 8 connections and against
 a compression path before it is fixed in the code.
 
+## kTLS SSL_sendfile (commit *tls: send static files through SSL_sendfile when kTLS is active*)
+
+The kTLS leg is measurable on this host: the kernel `tls` module is loaded and
+OpenSSL 3.5.9 has the kTLS BIO calls.  `strace` confirms the path is taken —
+one `sendfile(17, 18, [0] => [65536], 65536) = 65536` for a 64 KiB body, the
+file descriptor handed to the socket in a single call, which is `SSL_sendfile()`.
+
+A/A floor, same binary, 256 KiB over TLS with `ktls` on, 6 runs: **1.65%
+stdev, 4.21% max/min spread**.
+
+| body | ktls | old (memory path) | new (SSL_sendfile) | delta |
+|---|---|---|---|---|
+| 256 KiB | true | 2089 rps | 3802 rps | **+82.0%** |
+| 256 KiB | false | ~2070-2400 | ~2360-2372 | no consistent effect |
+| 16 KiB | true | 23993 rps | 25298 rps | +5.4% (single order, not corrected) |
+
+The 256 KiB figure is pooled over 12 cells per side and both run orders, and it
+reproduces in both: **+82.7%** with the new tree second, **+81.7%** with it
+first.  That is 50x the A/A floor.
+
+### The control, and why it mattered
+
+`ktls=false` must show no difference, because both trees then take the memory
+path.  The first control run showed **+14.3%**, which is nonsense and was almost
+taken at face value.  Re-running with the order reversed gave **-1.7%**, which
+is what the design predicts.  The two batches disagree, and the tree values
+show why: the new tree sits at ~2366 in both batches, while the old tree reads
+2074 in one and 2402 in the other.  That is **batch-to-batch drift of up to 15%
+on this 2 vCPU host**, not an order effect — which is why the kTLS figure is
+quoted from both orderings rather than one.
+
+### What this means for the change
+
+The kTLS half is the part that works: at 256 KiB it is an 82% throughput win and
+`SSL_sendfile()` is demonstrably the mechanism, not a code path that merely
+compiles.  The plain-sendfile half is the part that regresses below 16 KiB.
+Those are two separate commits and can be judged separately: the kTLS path is
+ready for review, the plain path needs a size threshold first.
+
 ## Limits of this measurement
 
 - 2 vCPU, shared-class box, loopback. Absolute rps are not a property of the

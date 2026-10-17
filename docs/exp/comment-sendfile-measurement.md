@@ -61,6 +61,31 @@ with body size, which is the intended win. The 16 KiB dip in the old column is
 the transition between one and two 128 KiB read buffers rather than a property
 of the change.
 
+### kTLS `SSL_sendfile()` — the half that works
+
+The same run over TLS, with the kernel `tls` module loaded and `ktls` on.
+`strace` confirms the mechanism: one `sendfile(17, 18, [0] => [65536],
+65536) = 65536` for a 64 KiB body, the file descriptor handed to the socket in
+a single call, which is `SSL_sendfile()`.
+
+| body | ktls | old (memory path) | new (SSL_sendfile) | delta |
+|---|---|---|---|---|
+| 256 KiB | true | 2089 rps | 3802 rps | **+82.0%** |
+| 256 KiB | false | ~2070-2400 | ~2360-2372 | no consistent effect |
+
+The TLS A/A floor is 1.65% stdev / 4.21% spread. The +82.0% is pooled over 12
+cells per side and both run orders, and reproduces in both (+82.7% with the new
+tree second, +81.7% with it first): 50x the floor.
+
+**One caveat, because it nearly went the other way.** The `ktls=false` control
+should show no difference, because both trees take the memory path then. The
+first run showed **+14.3%**, which is not a real effect. Reversing the order
+gave **-1.7%**, which is what the design predicts. The per-tree values explain
+it: the new tree sits at ~2366 in both batches while the old tree reads 2074 in
+one and 2402 in the other, so this is batch-to-batch drift of up to 15% on a
+2 vCPU host, not an order effect. That is why the kTLS figure is quoted from
+both orders.
+
 ### What it means
 
 The commit *static: send file buffers with sendfile() on plain connections
@@ -79,17 +104,19 @@ below — would capture the whole win and none of the loss. That threshold shoul
 still be confirmed at 2 and 8 connections and against a compression path before
 it is fixed in the code.
 
-So the change is right in direction and wrong in scope. This is the same concern
-that was raised before the port and it is now evidence rather than an argument.
+So the two commits should be judged separately. The kTLS `SSL_sendfile()` path is
+an 82% win at 256 KiB with the mechanism confirmed on the wire, and is ready for
+review. The plain-sendfile generalisation is right in direction and wrong in
+scope, and needs a size threshold first. This is the same concern that was
+raised before the port; for the plain path it is now evidence rather than an
+argument.
 
 ### Limits
 
 - 2 vCPU shared-class box over loopback. Absolute rps are not a property of the
   code; only the ratios between two trees measured together are.
-- **No TLS leg.** This measures the plain sendfile path only, i.e. commit B.
-  The kTLS `SSL_sendfile()` path (*tls: send static files through SSL_sendfile
-when kTLS is active*) is unmeasured: it needs `tls.ktls`
-  on and the kernel `tls` module, which this host does not load by default.
+- The TLS leg below is one size and one concurrency, and its 16 KiB cell is
+  single-order and therefore not order-corrected.
 - No hardware counters, so CPU-per-request is unavailable. Only rps and on-CPU ns
   were captured, and the ns column is too sparse at these rates to conclude from.
 - `wrk` discards the body; no retained latency percentiles beyond wrk's summary.
