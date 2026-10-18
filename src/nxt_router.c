@@ -6249,7 +6249,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         return;
     }
 
-    if (r->error) {
+    if (nxt_slow_path(r->error)) {
         nxt_request_rpc_data_unlink(task, req_rpc_data);
         return;
     }
@@ -6257,7 +6257,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     app = req_rpc_data->app;
     nxt_assert(app != NULL);
 
-    if (msg->port_msg.type == _NXT_PORT_MSG_REQ_HEADERS_ACK) {
+    if (nxt_slow_path(msg->port_msg.type == _NXT_PORT_MSG_REQ_HEADERS_ACK)) {
         nxt_router_req_headers_ack_handler(task, msg, req_rpc_data);
 
         return;
@@ -6277,7 +6277,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         req_rpc_data->rpc_cancel = 0;
 
-        if (req_rpc_data->apr_action == NXT_APR_REQUEST_FAILED) {
+        if (nxt_slow_path(req_rpc_data->apr_action == NXT_APR_REQUEST_FAILED)) {
             req_rpc_data->apr_action = NXT_APR_GOT_RESPONSE;
         }
 
@@ -6317,7 +6317,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         last_b = NULL;
 
         ret = nxt_http_comp_compress_app_response(task, r, &r->out);
-        if (ret == NXT_ERROR) {
+        if (nxt_slow_path(ret == NXT_ERROR)) {
             goto fail;
         }
 
@@ -6355,7 +6355,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
          * compressor behind (RFC 9110 Sect. 13.2.1).
          */
         ret = nxt_http_comp_check_acceptable(task, r);
-        if (ret != NXT_OK) {
+        if (nxt_slow_path(ret != NXT_OK)) {
             /*
              * No acceptable representation is a fault of the request, not of
              * the server, and it is the one non-NXT_OK result here that is
@@ -6363,7 +6363,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
              * but the answer is 406 rather than the 503 "fail:" gives
              * everything else.
              */
-            if (ret == NXT_HTTP_NOT_ACCEPTABLE) {
+            if (nxt_slow_path(ret == NXT_HTTP_NOT_ACCEPTABLE)) {
                 status = NXT_HTTP_NOT_ACCEPTABLE;
             }
 
@@ -6391,7 +6391,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
              * error response can end, and releases the other buffers.
              */
             ret = nxt_http_comp_compress_app_response(task, r, &b);
-            if (ret == NXT_ERROR) {
+            if (nxt_slow_path(ret == NXT_ERROR)) {
                 owned_b = b;
                 goto fail;
             }
