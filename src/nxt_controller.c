@@ -773,17 +773,6 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
     ls->read_after_accept = 1;
     ls->flags = NXT_NONBLOCK;
 
-#if 0
-    /* STUB */
-    wq = nxt_mp_zget(cf->mem_pool, sizeof(nxt_work_queue_t));
-    if (wq == NULL) {
-        return NXT_ERROR;
-    }
-    nxt_work_queue_name(wq, "listen");
-    /**/
-
-    ls->work_queue = wq;
-#endif
     ls->handler = nxt_controller_conn_init;
 
 #if (NXT_HAVE_UNIX_DOMAIN)

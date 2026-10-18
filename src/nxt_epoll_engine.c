@@ -1135,35 +1135,6 @@ nxt_epoll_edge_conn_io_connect(nxt_task_t *task, void *obj, void *data)
         c->socket.read = NXT_EVENT_BLOCKED;
         return;
 
-#if 0
-    case NXT_AGAIN:
-        nxt_conn_timer(engine, c, state, &c->write_timer);
-
-        /* Fall through. */
-
-    case NXT_OK:
-        /*
-         * Mark both read and write directions as ready and try to perform
-         * I/O operations before receiving readiness notifications.
-         * On unconnected socket Linux send() and recv() return EAGAIN
-         * instead of ENOTCONN.
-         */
-        c->socket.read_ready = 1;
-        c->socket.write_ready = 1;
-        /*
-         * Enabling both read and write notifications on a getting
-         * connected socket eliminates one epoll_ctl() syscall.
-         */
-        c->socket.write_handler = nxt_epoll_edge_event_conn_connected;
-        c->socket.error_handler = state->error_handler;
-
-        nxt_epoll_enable(engine, &c->socket);
-        c->socket.read = NXT_EVENT_BLOCKED;
-
-        handler = state->ready_handler;
-        break;
-#endif
-
     case NXT_ERROR:
         handler = state->error_handler;
         break;

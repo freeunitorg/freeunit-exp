@@ -374,8 +374,6 @@ space_after_target:
             }
         }
 
-        //rp->space_in_target = 1;
-
         if (rest) {
             goto rest_of_target;
         }
@@ -392,8 +390,6 @@ space_after_target:
             p++;
             goto space_after_target;
         }
-
-        //rp->space_in_target = 1;
 
         if (rest) {
             goto rest_of_target;
