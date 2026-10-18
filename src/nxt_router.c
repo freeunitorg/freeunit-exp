@@ -3407,12 +3407,6 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     }
 
     http = nxt_conf_get_path(root, &http_path);
-#if 0
-    if (http == NULL) {
-        nxt_alert(task, "no \"http\" block");
-        return NXT_ERROR;
-    }
-#endif
 
     websocket = nxt_conf_get_path(root, &websocket_path);
 
@@ -4443,53 +4437,6 @@ nxt_router_listen_socket_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     rpc = data;
     tmcf = rpc->temp_conf;
-
-#if 0
-    u_char                  *p;
-    size_t                  size;
-    uint8_t                 error;
-    nxt_buf_t               *in, *out;
-    nxt_sockaddr_t          *sa;
-
-    static nxt_str_t  socket_errors[] = {
-        nxt_string("ListenerSystem"),
-        nxt_string("ListenerNoIPv6"),
-        nxt_string("ListenerPort"),
-        nxt_string("ListenerInUse"),
-        nxt_string("ListenerNoAddress"),
-        nxt_string("ListenerNoAccess"),
-        nxt_string("ListenerPath"),
-    };
-
-    sa = rpc->socket_conf->listen->sockaddr;
-
-    in = nxt_buf_chk_make_plain(tmcf->mem_pool, msg->buf, msg->size);
-
-    if (nxt_slow_path(in == NULL)) {
-        return;
-    }
-
-    p = in->mem.pos;
-
-    error = *p++;
-
-    size = nxt_length("listen socket error: ")
-           + nxt_length("{listener: \"\", code:\"\", message: \"\"}")
-           + sa->length + socket_errors[error].length + (in->mem.free - p);
-
-    out = nxt_buf_mem_alloc(tmcf->mem_pool, size, 0);
-    if (nxt_slow_path(out == NULL)) {
-        return;
-    }
-
-    out->mem.free = nxt_sprintf(out->mem.free, out->mem.end,
-                        "listen socket error: "
-                        "{listener: \"%*s\", code:\"%V\", message: \"%*s\"}",
-                        (size_t) sa->length, nxt_sockaddr_start(sa),
-                        &socket_errors[error], in->mem.free - p, p);
-
-    nxt_debug(task, "%*s", out->mem.free - out->mem.pos, out->mem.pos);
-#endif
 
     nxt_router_conf_error(task, tmcf);
 }

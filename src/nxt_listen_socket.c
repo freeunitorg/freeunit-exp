@@ -79,13 +79,6 @@ nxt_listen_socket_create(nxt_task_t *task, nxt_mp_t *mp,
 
 #endif
 
-#if 0
-
-    /* Ignore possible error. TODO: why? */
-    (void) nxt_socket_setsockopt(task, s, SOL_SOCKET, SO_SNDBUF, 8192);
-
-#endif
-
     if (ls->read_after_accept) {
         nxt_socket_defer_accept(task, s, sa);
     }
