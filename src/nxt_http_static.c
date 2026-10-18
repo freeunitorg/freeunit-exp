@@ -560,7 +560,15 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_uint_t              level;
     nxt_file_t              *f, file;
     nxt_file_info_t         fi;
-    nxt_off_t               range_start, range_end;
+    /*
+     * Written by nxt_http_static_range() and read only when the same call
+     * returned 206 (is_range below), but no compiler can see that
+     * correlation through the helper's pointer arguments: at -Os the pair
+     * reads as maybe-uninitialized and -Werror refuses the build.  The zero
+     * is never used -- it only tells the compiler what the range helper
+     * already guarantees.
+     */
+    nxt_off_t               range_start = 0, range_end = 0;
     nxt_bool_t              is_range, etag_weak, svgz;
     nxt_http_status_t       rstatus;
     nxt_http_field_t        *field, *coding;
