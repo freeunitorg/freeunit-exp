@@ -79,9 +79,17 @@ produced results that contradict the 4-connection curve: at 8 connections the
 new tree won at every size including 8 KiB (+25%), where the 4-connection run
 had it at -9.4%. Single samples are not enough here — this host drifts up to 15%
 between batches, which is the same confound that made the kTLS control read
-+14.3% instead of 0%. The sweep is queued behind
-`scripts/sweep-sendfile-crossover.sh`, which replicates cells and alternates
-which tree runs first. **Do not treat 16 KiB as the threshold until that lands;
+<<<<<<< HEAD
++14.3% instead of 0%. The sweep has not been run: the measurement host was busy with another
+agent's build and then with a perf-lab `oha` run against a Drupal container.
+The harness is `scripts/sweep-sendfile-crossover.sh`, which replicates cells
+and alternates which tree runs first. **Do not treat 16 KiB as the threshold until that lands;
+=======
++14.3% instead of 0%. The sweep has not been run: the measurement host was busy with another
+agent's build and then with a perf-lab `oha` run against a Drupal container.
+The harness is `scripts/sweep-sendfile-crossover.sh`, which replicates cells
+and alternates which tree runs first. **Do not treat 16 KiB as the threshold until that lands;
+>>>>>>> 91381e5d (docs: mark the 16 KiB threshold unconfirmed, and add a sweep that can confirm it)
 treat it as the best single-order candidate.**
 
 Also unconfirmed for the threshold: the compressed response path, and any
