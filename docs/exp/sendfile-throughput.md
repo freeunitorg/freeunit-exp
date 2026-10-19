@@ -71,8 +71,21 @@ at both, just less bad at 8.
 The crossover is sharp and sits between 12 KiB (-6.5%) and 16 KiB (+81.1%). A
 size threshold in `nxt_http_static_sendfile()` — send a file buffer at or above
 16 KiB, keep the memory path below — would capture the whole win and none of the
-loss. That threshold should still be confirmed at 2 and 8 connections and against
-a compression path before it is fixed in the code.
+loss.
+
+**That threshold is not yet confirmed.** The figures above are all at 4
+connections. A follow-up sweep at 2 and 8 connections, one sample per point,
+produced results that contradict the 4-connection curve: at 8 connections the
+new tree won at every size including 8 KiB (+25%), where the 4-connection run
+had it at -9.4%. Single samples are not enough here — this host drifts up to 15%
+between batches, which is the same confound that made the kTLS control read
++14.3% instead of 0%. The sweep is queued behind
+`scripts/sweep-sendfile-crossover.sh`, which replicates cells and alternates
+which tree runs first. **Do not treat 16 KiB as the threshold until that lands;
+treat it as the best single-order candidate.**
+
+Also unconfirmed for the threshold: the compressed response path, and any
+concurrency below 4.
 
 ## kTLS SSL_sendfile (commit *tls: send static files through SSL_sendfile when kTLS is active*)
 
