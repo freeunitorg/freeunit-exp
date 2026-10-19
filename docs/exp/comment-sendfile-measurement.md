@@ -96,13 +96,45 @@ The regression shrinks as concurrency rises (8 conns: -14% versus -37% at 4),
 because the syscall amortises against more in-flight work. Both levels are
 reported for that reason.
 
-The crossover is sharp and sits between 12 KiB (-6.5%) and 16 KiB (+81.1%).
-Below it, `sendfile()` costs a syscall the memory path did not need; above it,
-the response stops being throughput-bound on the copy. A size threshold in
-`nxt_http_static_sendfile()` — file buffer at or above 16 KiB, memory path
-below — would capture the whole win and none of the loss. That threshold should
-still be confirmed at 2 and 8 connections and against a compression path before
-it is fixed in the code.
+### The threshold, confirmed across concurrency
+
+Replicated and order-balanced, 3 cells per side, alternating which tree runs
+first. Positive is a win for `sendfile()`:
+
+| conns | 8 KiB | 12 KiB | 16 KiB |
+|---|---|---|---|
+| 2 | -8.5% | +0.4% | +1.2% |
+| 4 | -9.4% | -6.5% | **+81.1%** |
+| 8 | **+25.2%** | **+11.6%** | **+55.0%** |
+
+**A correction.** An earlier version of this comment reported a one-sample sweep
+that appeared to contradict the 4-connection curve — a win at 8 KiB with 8
+connections, where the 4-connection figure was -9.4% — and wrote it off as
+probably noise. It reproduces at **+25.2%** over three order-balanced cells.
+The doubt was misplaced; the 4-connection row is the outlier at 8 KiB, not the
+8-connection row.
+
+**16 KiB is the smallest size at which `sendfile()` does not lose anywhere.** It
+wins by +81% and +55% where the server is the bottleneck and is flat where it is
+not. Below 16 KiB the sign flips with concurrency — -9% at 4 connections, +25%
+at 8, flat at 2 — so a 16 KiB threshold costs at most the 8-12 KiB band, where
+the effect is under 10% either way and not consistently one sign. That is the
+argument for 16 KiB rather than 8.
+
+At 2 connections nothing separates the paths at any size: the load generator
+and the server each own a core of a 2 vCPU box, so two connections cannot
+saturate the server and those cells measure the client.
+
+Still unconfirmed: the compressed response path, and sizes between 16 and
+128 KiB at more than two concurrency levels.
+
+### Crossover, restated
+
+Below 16 KiB `sendfile()` costs a syscall the memory path did not need on a
+response that was never throughput-bound; above it the response stops being
+bound on the copy. A size threshold in `nxt_http_static_sendfile()` — file
+buffer at or above 16 KiB, memory path below — captures the whole win and none
+of the loss.
 
 So the two commits should be judged separately. The kTLS `SSL_sendfile()` path is
 an 82% win at 256 KiB with the mechanism confirmed on the wire, and is ready for

@@ -40,5 +40,7 @@ for sz in $SIZES; do
             PORT=$((PORT + 1))
             sleep 1
         done
+
+        rep=$((rep + 1))
     done
 done

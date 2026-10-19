@@ -68,32 +68,45 @@ The regression shrinks as concurrency rises (the syscall amortises against more
 in-flight work), which is why both levels are reported — the regression is real
 at both, just less bad at 8.
 
-The crossover is sharp and sits between 12 KiB (-6.5%) and 16 KiB (+81.1%). A
-size threshold in `nxt_http_static_sendfile()` — send a file buffer at or above
-16 KiB, keep the memory path below — would capture the whole win and none of the
-loss.
+A size threshold in `nxt_http_static_sendfile()` — send a file buffer at or
+above a minimum, keep the memory path below it — would capture the win and avoid
+the loss. The minimum is 16 KiB, and the evidence for that is below.
 
-**That threshold is not yet confirmed.** The figures above are all at 4
-connections. A follow-up sweep at 2 and 8 connections, one sample per point,
-produced results that contradict the 4-connection curve: at 8 connections the
-new tree won at every size including 8 KiB (+25%), where the 4-connection run
-had it at -9.4%. Single samples are not enough here — this host drifts up to 15%
-between batches, which is the same confound that made the kTLS control read
-<<<<<<< HEAD
-+14.3% instead of 0%. The sweep has not been run: the measurement host was busy with another
-agent's build and then with a perf-lab `oha` run against a Drupal container.
-The harness is `scripts/sweep-sendfile-crossover.sh`, which replicates cells
-and alternates which tree runs first. **Do not treat 16 KiB as the threshold until that lands;
-=======
-+14.3% instead of 0%. The sweep has not been run: the measurement host was busy with another
-agent's build and then with a perf-lab `oha` run against a Drupal container.
-The harness is `scripts/sweep-sendfile-crossover.sh`, which replicates cells
-and alternates which tree runs first. **Do not treat 16 KiB as the threshold until that lands;
->>>>>>> 91381e5d (docs: mark the 16 KiB threshold unconfirmed, and add a sweep that can confirm it)
-treat it as the best single-order candidate.**
+### The threshold, confirmed across concurrency
 
-Also unconfirmed for the threshold: the compressed response path, and any
-concurrency below 4.
+Replicated and order-balanced with `scripts/sweep-sendfile-crossover.sh`
+(3 cells per side, the tree that goes first alternating every rep). Delta in
+percent, positive is a win for sendfile:
+
+| conns | 8 KiB | 12 KiB | 16 KiB |
+|---|---|---|---|
+| 2 | -8.5% | +0.4% | +1.2% |
+| 4 | -9.4% | -6.5% | **+81.1%** |
+| 8 | **+25.2%** | **+11.6%** | **+55.0%** |
+
+Two things follow, and the first corrects an earlier note here.
+
+**The single-sample sweep that appeared to contradict the 4-connection curve
+was right.** At 8 connections it showed a win at every size including 8 KiB,
+which contradicted the -9.4% measured at 4 connections; that was written up as
+probably noise. It reproduces at +25.2% over three order-balanced cells. The
+doubt was misplaced — the 4-connection row is the outlier at 8 KiB, not the
+8-connection row.
+
+**16 KiB is the smallest size at which sendfile does not lose anywhere.** At
+16 KiB it wins by +81% and +55% where the server is the bottleneck and is flat
+where it is not. Below 16 KiB the sign flips with concurrency: -9% at 4
+connections, +25% at 8, flat at 2. A 16 KiB threshold therefore costs at most
+the 8-12 KiB band, where the effect is under 10% either way and not
+consistently one sign. That is the argument for 16 KiB rather than 8.
+
+At 2 connections nothing separates the two paths at any size: with the load
+generator and the server each on a core of a 2 vCPU box, two connections cannot
+saturate the server, so those cells measure the client. They bound the low end
+rather than test the path.
+
+Still unconfirmed: the compressed response path, and body sizes between 16 and
+128 KiB at more than two concurrency levels.
 
 ## kTLS SSL_sendfile (commit *tls: send static files through SSL_sendfile when kTLS is active*)
 
