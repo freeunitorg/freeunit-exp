@@ -120,9 +120,19 @@ See `docs/exp/logs-json-writer-contract.md` and the frozen vectors in
 
 - Never log: `Authorization`, `Cookie`, `Set-Cookie`, TLS material, request
   bodies that may carry secrets, and personal data from cookies. Enforce by name:
-  the fixed field set simply does not include these variables, and the object
-  form must refuse (at config validation, `src/nxt_conf_validation.c`) any
-  member whose expanded value is one of these names.
+  the fixed field set does not include these variables, and the object form must
+  be checked for them at configuration load.
+- **That check must warn, not refuse.** An earlier version of this note said the
+  object form "must refuse" a member naming a credential variable. Upstream built
+  exactly that (freeunitorg/freeunit `4ba018f1`) and had to take it out again
+  (`faa87a8d`): it is a new restriction in a patch release, a configuration that
+  1.37.0 accepted became refused, and the check did not look at `vldt->restored`,
+  so a stored `conf.json` naming such a variable was refused at startup — unitd
+  then ran with the empty default configuration and the first successful update
+  through the control API overwrote the stored file. The configuration was lost.
+  Refusing here is a data-loss risk, not a safety gain. The current behaviour is
+  the right shape: accept the format, and warn from the router when it compiles
+  one, naming the field for the object format.
 - #376 closure in the JSON path: escaping is mandatory because the format is
   structured; `"` and `\` and every byte `< 0x20` are always escaped, and invalid
   UTF-8 is replaced before serialisation. No hand-assembled `sprintf`/`strcat`.

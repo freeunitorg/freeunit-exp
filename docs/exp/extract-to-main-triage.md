@@ -42,3 +42,29 @@ CI for upstream only if upstream wants it; NO = exp-only, keep in the fork.
   not upstream.
 - PR 33 already has CHANGES and changes.xml entries; those must be re-checked
   against upstream's changelog format, not copied verbatim.
+
+
+## Re-checked against master 13effad4 (2026-10-19)
+
+Master took three of the four extractions while they sat in local worktrees.
+This table supersedes the verdict column above for those rows.
+
+| my branch | master commit | outcome |
+|---|---|---|
+| `fix/h1p-conn-guard` (`81abb1eb`) | `9c92fbdf` + `50bbf86b` | **drop it.** Upstream's guard is materially safer: it wraps the h1proto in `nxt_h1p_slot_t` with the owner pointer at offset 0 and checks that, whereas the ported version read `h1p->conn`, which sits past a third of the way into `nxt_h1proto_t`. With an `nxt_http_peer_t` in the slot — which `nxt_h1p_peer_connect()` puts there — that read lands inside `inline_fields[]`, a heap string pointer, and could alias the connection. Offset 0 is a defined pointer field. Merging the port would have weakened a fix that is already in. |
+| `fix/router-atomic-accounting` (`2f3ea988`, `676597b5`) | `d07c778f` | **drop it.** Both ported commits landed as one larger upstream commit (431 insertions against 154) which also changes `auto/atomic` and `src/nxt_atomic.h`, and uses `nxt_atomic_load()` on the hot reads rather than plain volatile reads. |
+| `feat/tls-ktls-option` (`f287eb66`) | — | **still live.** `ktls` appears nowhere on master. Applies clean. |
+| `feat/tls-sendfile` (`5fec24e2`, `4d2a831c`) | — | **still live.** No `sendfile_ready` on master. All three apply clean in order. |
+
+Consequences beyond the branch table:
+
+- The ported h1proto test is not merely redundant, it is written against the
+  old contract: it hands a bare `nxt_h1proto_t` to `nxt_h1p_complete_buffers()`
+  where the upstream test hands `&slot.h1p`. It would keep passing under the
+  slot code for the wrong reason, which is worse than not having it.
+- The measurement of the plain sendfile path stands; the branch that carried it
+  is the one that is still needed.
+- `docs/exp/logs-structured-json.md` claimed the object form "must refuse" a
+  credential variable at validation. Upstream built that (`4ba018f1`) and removed
+  it (`faa87a8d`) after it refused a stored `conf.json` at startup and lost the
+  configuration. The note now says warn, and says why.
