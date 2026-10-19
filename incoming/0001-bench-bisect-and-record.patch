@@ -1,0 +1,182 @@
+From 838f95ee633ad98783c7323deab6d5bcad4736e4 Mon Sep 17 00:00:00 2001
+From: FreeUnitOPS <ops@freeunit.org>
+Date: Sun, 18 Oct 2026 11:19:48 +0000
+Subject: [PATCH 1/2] bench: queue the post-release server bisect, and record a
+ named arm's commit
+
+The range b09815f1..33896f7e is 26 commits and only its ends are measured, so
+"the server went up" has no bisect and no release baseline on hello -- the one
+cell where the server layer is the whole request.
+
+128 splits the range at 1f7511a3, its only core commit; 124 is the missing
+release baseline.  Their images are built by build-images.sh, and the two jobs
+run in scripts/campaign.steps.bisect-server.
+
+A master-<sha> arm published :master's sha instead of its own: run 118 names
+b09815f1 and ff694772 while both arms ran master-33896f7, which reads as one
+build across two hosts when it is not even the same image.  run.sh now writes
+runtime_a_commit/runtime_a_image for a named-commit arm beside the image id.
+
+OPS-Agent: DeepSeek Flash
+---
+ bench/cells.sh                       |  7 +++++--
+ bench/jobs/128-hello-1f7511a3.job    | 24 ++++++++++++++++++++++++
+ bench/run.sh                         | 15 +++++++++++++++
+ docs/state.md                        | 15 +++++++++++++++
+ scripts/build-images.sh              | 10 ++++++++++
+ scripts/campaign.steps.bisect-server | 10 ++++++++++
+ 6 files changed, 79 insertions(+), 2 deletions(-)
+ create mode 100644 bench/jobs/128-hello-1f7511a3.job
+ create mode 100644 scripts/campaign.steps.bisect-server
+
+diff --git a/bench/cells.sh b/bench/cells.sh
+index f39e122..79adf03 100755
+--- a/bench/cells.sh
++++ b/bench/cells.sh
+@@ -130,6 +130,9 @@ image_for() {  # runtime family -> image
+     # moving :master: the hot-path audit compares :master with :master-o2 and
+     # :master-lto images built from one commit (42, 43, 16r).
+     freeunit-master-33896f7) echo "drupal-bench-freeunit:master-33896f7" ;;
++    # The bisect point of b09815f1..33896f7e: the range's only core commit is
++    # below it, so the pair 128 separates the lower half from the upper seven.
++    freeunit-master-1f7511a3) echo "drupal-bench-freeunit:master-1f7511a3" ;;
+     # PR #768: its base (master 10e1a9bec) and its head, so the delta is the PR.
+     freeunit-768-base) echo "drupal-bench-freeunit:768-base" ;;
+     freeunit-768-head) echo "drupal-bench-freeunit:768-head" ;;
+@@ -335,7 +338,7 @@ start_rt() {  # runtime side -> name
+     local preload_vol=()
+     [ -f "$sitedir/preload.ini" ] && preload_vol=(-v "$sitedir/preload.ini:/usr/local/etc/php/conf.d/zz-preload.ini:ro")
+     case "$rt" in
+-    freeunit|freeunit-direct|freeunit-master|freeunit-master-old|freeunit-master-mid|freeunit-musl|freeunit-master-o2|freeunit-master-lto|freeunit-742-base|freeunit-742-head|freeunit-master-33896f7|freeunit-768-base|freeunit-768-head)
++    freeunit|freeunit-direct|freeunit-master|freeunit-master-old|freeunit-master-mid|freeunit-musl|freeunit-master-o2|freeunit-master-lto|freeunit-742-base|freeunit-742-head|freeunit-master-33896f7|freeunit-master-1f7511a3|freeunit-768-base|freeunit-768-head)
+         local cfg="$RESROOT/runtimes/$rt.json"
+         [ -f "$cfg" ] || cfg="$RESROOT/runtimes/freeunit.json"
+         docker run -d --name "$name" --network "$net" --cpuset-cpus "$SERVER_CPUS" \
+@@ -562,7 +565,7 @@ PY
+     local alerts=0 alog=
+     [ "$pre" = 1 ] && alerts=$((alerts + 1))
+     case "$rt" in
+-    freeunit|freeunit-master|freeunit-master-old|freeunit-master-mid|freeunit-musl|freeunit-direct|freeunit-master-o2|freeunit-master-lto|freeunit-742-base|freeunit-742-head|freeunit-master-33896f7|freeunit-768-base|freeunit-768-head)
++    freeunit|freeunit-master|freeunit-master-old|freeunit-master-mid|freeunit-musl|freeunit-direct|freeunit-master-o2|freeunit-master-lto|freeunit-742-base|freeunit-742-head|freeunit-master-33896f7|freeunit-master-1f7511a3|freeunit-768-base|freeunit-768-head)
+         alog=$(docker logs "$name" 2>&1 | grep -E '\[(alert|crit|emerg)\]' || true) ;;
+     *)
+         alog=$(docker logs "$name" 2>&1 | grep -E '\[(crit|emerg|alert)\]|worker process is shutting down unexpectedly' || true) ;;
+diff --git a/bench/jobs/128-hello-1f7511a3.job b/bench/jobs/128-hello-1f7511a3.job
+new file mode 100644
+index 0000000..59f1625
+--- /dev/null
++++ b/bench/jobs/128-hello-1f7511a3.job
+@@ -0,0 +1,24 @@
++# The bisect point of b09815f1..33896f7e (26 commits), on hello, where the server
++# layer is the whole request. A delta between it and the head names the half that
++# moved the cost: 1f7511a3 is the only core commit in the lower half (atomics,
++# `core: finish the mixed atomic and plain accesses`), the upper seven are CI and
++# tools plus `build: require __thread`. No delta moves the search to the top.
++JOB=128-hello-1f7511a3
++ISSUE="https://github.com/freeunitorg/benchmarks-drupal"
++PHASES="null ab"
++WORKLOAD=php-hello
++RUNTIME_A=freeunit-master-1f7511a3
++RUNTIME_B=freeunit-master-33896f7
++SITE=hello
++CONNS=32
++WARM=2
++DUR=8
++REPS=3
++PERF=1
++SERVER_CPUS=0,1
++LOAD_CPUS=2,3,6,7
++DB_CPUS=4,5
++PRIMARY=s_instructions
++NULL_LIMIT_PCT=5
++EXPECT="1f7511a3 and 33896f7e are the same server on hello: the range's only core change is the atomic one below the split, so a split that is flat says the cost arrived above it"
++FALSIFY="a CLAIM above the band: 1f7511a3 is measurably cheaper, so whatever moved the server sits in the seven commits between it and the head"
+diff --git a/bench/run.sh b/bench/run.sh
+index 387b5f2..7018641 100755
+--- a/bench/run.sh
++++ b/bench/run.sh
+@@ -203,6 +203,21 @@ cp -f "$RUNROOT/site/$SITE/meta.txt" "$OUTDIR/site-meta.txt" 2>/dev/null || true
+     echo "freeunit_master_old_image=$(docker image inspect -f '{{.Id}}' drupal-bench-freeunit:master-old 2>/dev/null | cut -c8-19)"
+     echo "freeunit_master_mid_sha=$(cat "$RUNROOT/freeunit-master-mid-sha" 2>/dev/null || echo unknown)"
+     echo "freeunit_master_mid_image=$(docker image inspect -f '{{.Id}}' drupal-bench-freeunit:master-mid 2>/dev/null | cut -c8-19)"
++    # A named-commit image (drupal-bench-freeunit:master-<sha>) is a different tree
++    # from :master, so the sha above says nothing about what the arm ran.  Record the
++    # commit the tag names and the image id beside it: run 118 was published with
++    # :master's sha (b09815f1 / ff694772) while both arms ran master-33896f7, which
++    # reads as "the same build" across two hosts when it is not even the same image.
++    for _side in A B; do
++        eval "_rt=\$RUNTIME_$_side"
++        case "$_rt" in
++        freeunit-master-[0-9a-f]*)
++            _lc=$(printf '%s' "$_side" | tr 'AB' 'ab')
++            echo "runtime_${_lc}_commit=${_rt#freeunit-master-}"
++            echo "runtime_${_lc}_image=$(docker image inspect -f '{{.Id}}' "drupal-bench-freeunit:master-${_rt#freeunit-master-}" 2>/dev/null | cut -c8-19)"
++            ;;
++        esac
++    done
+     echo "fpm_image=$(docker image inspect -f '{{.Id}}' drupal-bench-fpm:8.5 2>/dev/null | cut -c8-19)"
+     echo "apache_image=$(docker image inspect -f '{{.Id}}' drupal-bench-apache:8.5 2>/dev/null | cut -c8-19)"
+     echo "mariadb_image=$(docker image inspect -f '{{.Id}}' mariadb:10.11 2>/dev/null | cut -c8-19)"
+diff --git a/docs/state.md b/docs/state.md
+index 5df335f..549870d 100644
+--- a/docs/state.md
++++ b/docs/state.md
+@@ -326,3 +326,18 @@ short version.
+   `115`/`116` written, run them one at a time when no loop job holds `run/.run.lock`.
+ * Queues: pro4s-2 `matrix=5 apache=5 master=5 musl=3`, pro4s-4 `front=1 core=7 master=5 beta2=3`,
+   o-build idle; both x86 boxes gated by another session.
++
++## Queued 2026-10-18: the post-release server bisect (b09815f1..33896f7e)
++
++The range holds 26 commits and only its two ends have a number: `b09815f1` was the
++`:master` image on pro4s-2, `33896f7e` is the `master-33896f7` image. No release
++baseline on hello exists, which is where a server-layer move is visible —
++front-anon is dominated by Drupal and the database. `scripts/campaign.steps.bisect-server`
++runs 124 (hello, master vs 1.37.0) and then 128 (hello, `1f7511a3` vs `33896f7e`,
++the range split at its only core commit, `core: finish the mixed atomic and plain
++accesses`). Both images are now built by `scripts/build-images.sh`.
++
++Provenance fix in the same commit: a `master-<sha>` arm used to publish `:master`'s
++sha in `meta.txt` (run 118 shows `b09815f1` and `ff694772` while both arms ran
++`master-33896f7`), so `bench/run.sh` now records `runtime_a_commit`/`runtime_a_image`
++for a named-commit arm.
+diff --git a/scripts/build-images.sh b/scripts/build-images.sh
+index e5a679f..22a88de 100755
+--- a/scripts/build-images.sh
++++ b/scripts/build-images.sh
+@@ -29,6 +29,16 @@ docker build -f docker/Dockerfile.freeunit \
+ docker build -f docker/Dockerfile.freeunit \
+     --build-arg FREEUNIT_REF="$MASTER_MID_REF" -t drupal-bench-freeunit:master-mid .
+ 
++# Master commits named in the tag, so a newer master is measured without moving
++# :master (the hot-path audit's o2/lto pairs are built from one commit).  The
++# head of the post-release range and its bisect point, both needed by 124/128.
++MASTER_HEAD_REF=${FREEUNIT_MASTER_HEAD_REF:-33896f7eeb81b6f86cb6e0e0ec91b7cc66ebb65e}
++MASTER_SPLIT_REF=${FREEUNIT_MASTER_SPLIT_REF:-1f7511a393bf7630fef3b013943d60933138ef97}
++docker build -f docker/Dockerfile.freeunit \
++    --build-arg FREEUNIT_REF="$MASTER_HEAD_REF" -t drupal-bench-freeunit:master-33896f7 .
++docker build -f docker/Dockerfile.freeunit \
++    --build-arg FREEUNIT_REF="$MASTER_SPLIT_REF" -t drupal-bench-freeunit:master-1f7511a3 .
++
+ # The run's meta.txt reads this file, so a published master number names the
+ # commit it was built from instead of "unknown".
+ mkdir -p "$RUNROOT"
+diff --git a/scripts/campaign.steps.bisect-server b/scripts/campaign.steps.bisect-server
+new file mode 100644
+index 0000000..6da9eee
+--- /dev/null
++++ b/scripts/campaign.steps.bisect-server
+@@ -0,0 +1,10 @@
++# Which commit in b09815f1..33896f7e raised the server cost.
++#
++# 124 is the missing release baseline on hello (nothing has measured master
++# against 1.37.0 there since the master-to-master pairs 50/53/54 showed -11 %),
++# and 128 is the split of the 26-commit range at its only core commit.  Run 124
++# first: if master is at or below 1.37.0 on hello, there is no post-release cost
++# to bisect and 128 only says where the flat part is.
++site:hello
++job:bench/jobs/124-hello-master-33896f7-vs-1370.job
++job:bench/jobs/128-hello-1f7511a3.job
+-- 
+2.55.0
+

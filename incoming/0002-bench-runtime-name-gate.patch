@@ -1,0 +1,157 @@
+From 36fdf06b106e9074f91330bd4f5e3ef4945936dc Mon Sep 17 00:00:00 2001
+From: FreeUnitOPS <ops@freeunit.org>
+Date: Sun, 18 Oct 2026 11:38:21 +0000
+Subject: [PATCH 2/2] bench: gate runtime names, and queue the record run
+
+A job that names a runtime cells.sh does not know still starts a container --
+on the nginx path -- and comes back INVALID after a quiet window is gone (job
+40 lost two runs that way).  The name has to appear in image_for(), in one of
+the two start-path lists, and in the freeunit alert list; nothing reminded a
+human of the third.
+
+check-runtime-names.sh reads those lists as lists and fails on a gap.  Verified
+against four inputs: the real tree (pass, 19 names), a job naming an unknown
+runtime (three misses), a cells.sh with the name deleted from the start path,
+and one with it deleted from the alert list (both fail).  The first version of
+the check passed the third case because it compared against the union of every
+freeunit list, and BusyBox sed silently ignores the `0,/re/` address form, so
+the first probe edited nothing -- both traps are in the script's comments.
+
+campaign.steps.record queues 16r: the perf-record twin of 16, which is the gate
+for any further server-side work.
+
+OPS-Agent: DeepSeek Flash
+---
+ scripts/campaign.steps.record  |  10 ++++
+ scripts/check-runtime-names.sh | 102 +++++++++++++++++++++++++++++++++
+ 2 files changed, 112 insertions(+)
+ create mode 100644 scripts/campaign.steps.record
+ create mode 100755 scripts/check-runtime-names.sh
+
+diff --git a/scripts/campaign.steps.record b/scripts/campaign.steps.record
+new file mode 100644
+index 0000000..f68d80d
+--- /dev/null
++++ b/scripts/campaign.steps.record
+@@ -0,0 +1,10 @@
++# Attribution run: where the server's instructions actually go.
++#
++# 16r is the perf-record twin of 16 (drupal-front, master vs nginx-fpm) with
++# PERF_RECORD=1, so the samples name kernel stacks and basic blocks instead of
++# only counting them.  It is the gate for every remaining server-side idea: the
++# hot-path audit put 40.6% of router samples in the kernel (ports, shm, wakeups),
++# and piggybacking a response size into the port message is blind work without
++# that attribution.
++site:11.4
++job:bench/jobs/16r-front-anon-master-vs-fpm-record-11.4.job
+diff --git a/scripts/check-runtime-names.sh b/scripts/check-runtime-names.sh
+new file mode 100755
+index 0000000..f9158e2
+--- /dev/null
++++ b/scripts/check-runtime-names.sh
+@@ -0,0 +1,102 @@
++#!/bin/bash
++# check-runtime-names.sh -- a job may only name runtimes that cells.sh knows.
++#
++# Why this exists: bench/cells.sh decides a container's start path with
++# `case "$rt" in` lists, and a runtime name missing from one of them falls
++# through to the nginx branch: the container starts, serves nothing, and the job
++# comes back INVALID after a whole quiet window is spent.  Job 40 lost two runs
++# exactly that way (docs/audit-hotpath-2026-10.md, trap (d)).  A new name has to
++# appear in three places and nothing reminds a human of the third:
++#
++#   1. image_for()                        -> which image the name runs
++#   2. one of the two start-path lists    -> freeunit runtime or nginx runtime;
++#      (freeunit|..., nginx-fpm|...)         a name in neither falls through
++#   3. the freeunit alert list            -> which log patterns make a cell INVALID
++#
++# The lists are read as lists, not as one union: a name added to the start path
++# but not to the alert filter still publishes a container whose alerts nobody
++# counts as INVALID.  That is why the first version of this check passed a
++# cells.sh with the name deleted from one list.
++#
++#   scripts/check-runtime-names.sh [JOBS_DIR]
++#   CELLS=other/cells.sh scripts/check-runtime-names.sh   # probe
++set -euo pipefail
++cd "$(dirname "$0")/.."
++
++CELLS=${CELLS:-bench/cells.sh}
++JOBS=${1:-bench/jobs}
++TMP=$(mktemp)
++trap 'rm -f "$TMP"' EXIT
++
++[ -f "$CELLS" ] || { echo "no $CELLS" >&2; exit 2; }
++[ -d "$JOBS" ] || { echo "no jobs dir: $JOBS" >&2; exit 2; }
++
++# image_for(): one `name)` arm per line.
++mapfile -t IMAGES < <(
++    awk '/^image_for\(\)/,/^}/' "$CELLS" \
++        | sed -n 's/^[[:space:]]*\([a-z0-9][a-z0-9_-]*\))[[:space:]].*/\1/p' \
++        | sort -u
++)
++
++# Every |-joined case list, one per line as "<line>:<name>|<name>|...".
++grep -nE '^[[:space:]]*[a-z0-9][a-z0-9_-]*(\|[a-z0-9][a-z0-9_-]*)+\)$' "$CELLS" \
++    | sed 's/[[:space:]]*)$//' > "$TMP" || true
++
++# The start path is decided by a pair of lists: the freeunit one and the nginx
++# one it falls through to.  Both start with `freeunit|...` in other places (the
++# alert filter does too), so the pair is found by position: the nginx list and
++# the freeunit list immediately above it.  Taking every freeunit list here is
++# what let a name deleted from the real start path pass the first version.
++nginx_line=$(grep -E ':[[:space:]]*nginx-fpm(\||$)' "$TMP" | head -1 | cut -d: -f1)
++free_start_line=$(grep -E ':[[:space:]]*freeunit(\||$)' "$TMP" | cut -d: -f1 \
++    | awk -v n="$nginx_line" '$1 + 0 < n + 0' | tail -1)
++start_paths="$free_start_line $nginx_line"
++alert_line=$(grep -E ':[[:space:]]*freeunit(\||$)' "$TMP" | tail -1 | cut -d: -f1)
++
++[ "${#IMAGES[@]}" -gt 0 ] || { echo "$CELLS: parsed no image_for names" >&2; exit 2; }
++[ -n "$nginx_line" ] && [ -n "$free_start_line" ] \
++    || { echo "$CELLS: parsed no start-path list pair" >&2; exit 2; }
++[ -n "$start_paths" ] || { echo "$CELLS: parsed no start-path lists" >&2; exit 2; }
++[ -n "$alert_line" ] || { echo "$CELLS: parsed no freeunit alert list" >&2; exit 2; }
++
++in_list() {  # in_list <line> <name>
++    local line=$1 name=$2 tokens
++    tokens=$(grep -E "^$line:" "$TMP" | cut -d: -f2- | tr -d '[:space:]')
++    case "|$tokens|" in *"|$name|"*) return 0 ;; esac
++    return 1
++}
++
++in_start_path() {
++    local n
++    for n in $start_paths; do in_list "$n" "$1" && return 0; done
++    return 1
++}
++
++rc=0
++runtimes=$(sed -n 's/^RUNTIME_\(A\|B\)=//p' "$JOBS"/*.job | tr -d '"' | sort -u)
++
++for rt in $runtimes; do
++    case " ${IMAGES[*]} " in
++    *" $rt "*) ;;
++    *) echo "MISSING in image_for(): $rt (a job names it, cells.sh cannot map it to an image)"; rc=1 ;;
++    esac
++
++    if ! in_start_path "$rt"; then
++        echo "MISSING from both start-path lists: $rt (would fall through to the nginx start path)"
++        rc=1
++    fi
++
++    case "$rt" in
++    freeunit*)
++        if ! in_list "$alert_line" "$rt"; then
++            echo "MISSING from the freeunit alert list ($CELLS:$alert_line): $rt (its alerts would not mark a cell INVALID)"
++            rc=1
++        fi ;;
++    esac
++done
++
++if [ "$rc" = 0 ]; then
++    echo "runtime names: $(printf '%s\n' $runtimes | wc -l | tr -d ' ') names; image_for(), start path and alert list agree"
++fi
++
++exit "$rc"
+-- 
+2.55.0
+
