@@ -37,7 +37,8 @@ nxt_limit_zone_test(nxt_thread_t *thr)
     u_char               long_key[17];
     uint64_t             now;
 
-    mp = nxt_mp_create(1024, 128, 4096, 64);
+    /* cluster must be at least a page: 8 pages, 4 KiB pages. */
+    mp = nxt_mp_create(32768, 128, 4096, 64);
 
     NXT_TEST_CHECK(thr->log, mp != NULL, "nxt_mp_create() failed");
 
