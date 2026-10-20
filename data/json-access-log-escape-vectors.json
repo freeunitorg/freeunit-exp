@@ -1,0 +1,210 @@
+{
+  "title": "FreeUnit JSON access log escaping vectors (frozen test data)",
+  "rfc": "RFC 8259 (JSON text is UTF-8; control chars U+0000-001F must be escaped; \\ and \" must be escaped)",
+  "issues": [
+    "freeunit-exp#69",
+    "freeunit-exp#70",
+    "freeunit#196",
+    "freeunit#376",
+    "freeunit#377",
+    "freeunit#541"
+  ],
+  "rules": {
+    "escape": [
+      "U+0022 QUOTATION MARK as \\\"",
+      "U+005C REVERSE SOLIDUS as \\\\",
+      "U+0008 \\b",
+      "U+0009 \\t",
+      "U+000A \\n",
+      "U+000C \\f",
+      "U+000D \\r",
+      "every other U+0000..U+001F as \\u00XX (uppercase hex)"
+    ],
+    "do_not_escape": [
+      "U+002F SOLIDUS (optional; chosen: no)",
+      "U+007F DEL and all code points above (valid Unicode)",
+      "valid multibyte UTF-8 sequences"
+    ],
+    "preprocessing": "every resolved value passes nxt_utf8_sanitize() first: invalid UTF-8 bytes are replaced per byte with U+FFFD (EF BF BD); this guarantees the writer only ever sees valid UTF-8",
+    "max_record": "refuse the record (return NXT_ERROR) if nxt_conf_json_length() based size computation overflows SIZE_MAX; per-request buffer allocation failure likewise refuses the whole record. Never emit a torn/partial JSON record.",
+    "output_encoding": "UTF-8 bytes, no charset parameter implied; newline terminates the record"
+  },
+  "vectors": [
+    {
+      "id": "double-quote",
+      "input_bytes_hex": "61 22 62",
+      "input_repr": "b'a\"b'",
+      "sanitized_utf8_hex": "61 22 62",
+      "expected_json_string_content": "a\\\"b",
+      "notes": "mandatory: quote"
+    },
+    {
+      "id": "backslash",
+      "input_bytes_hex": "61 5c 62",
+      "input_repr": "b'a\\\\b'",
+      "sanitized_utf8_hex": "61 5c 62",
+      "expected_json_string_content": "a\\\\b",
+      "notes": "mandatory: backslash"
+    },
+    {
+      "id": "slash",
+      "input_bytes_hex": "61 2f 62",
+      "input_repr": "b'a/b'",
+      "sanitized_utf8_hex": "61 2f 62",
+      "expected_json_string_content": "a/b",
+      "notes": "slash is NOT escaped (RFC 8259 does not require it)"
+    },
+    {
+      "id": "backspace",
+      "input_bytes_hex": "61 08 62",
+      "input_repr": "b'a\\x08b'",
+      "sanitized_utf8_hex": "61 08 62",
+      "expected_json_string_content": "a\\bb",
+      "notes": "named escape \\b"
+    },
+    {
+      "id": "tab",
+      "input_bytes_hex": "61 09 62",
+      "input_repr": "b'a\\tb'",
+      "sanitized_utf8_hex": "61 09 62",
+      "expected_json_string_content": "a\\tb",
+      "notes": "named escape \\t"
+    },
+    {
+      "id": "newline",
+      "input_bytes_hex": "61 0a 62",
+      "input_repr": "b'a\\nb'",
+      "sanitized_utf8_hex": "61 0a 62",
+      "expected_json_string_content": "a\\nb",
+      "notes": "named escape \\n"
+    },
+    {
+      "id": "formfeed",
+      "input_bytes_hex": "61 0c 62",
+      "input_repr": "b'a\\x0cb'",
+      "sanitized_utf8_hex": "61 0c 62",
+      "expected_json_string_content": "a\\fb",
+      "notes": "named escape \\f"
+    },
+    {
+      "id": "carriage-return",
+      "input_bytes_hex": "61 0d 62",
+      "input_repr": "b'a\\rb'",
+      "sanitized_utf8_hex": "61 0d 62",
+      "expected_json_string_content": "a\\rb",
+      "notes": "named escape \\r"
+    },
+    {
+      "id": "control-0x00",
+      "input_bytes_hex": "61 00 62",
+      "input_repr": "b'a\\x00b'",
+      "sanitized_utf8_hex": "61 00 62",
+      "expected_json_string_content": "a\\u0000b",
+      "notes": "other control as \\u0000"
+    },
+    {
+      "id": "control-0x01",
+      "input_bytes_hex": "61 01 62",
+      "input_repr": "b'a\\x01b'",
+      "sanitized_utf8_hex": "61 01 62",
+      "expected_json_string_content": "a\\u0001b",
+      "notes": "other control as \\u0001"
+    },
+    {
+      "id": "control-0x1F",
+      "input_bytes_hex": "61 1f 62",
+      "input_repr": "b'a\\x1fb'",
+      "sanitized_utf8_hex": "61 1f 62",
+      "expected_json_string_content": "a\\u001Fb",
+      "notes": "other control as \\u001F"
+    },
+    {
+      "id": "del-0x7F",
+      "input_bytes_hex": "61 7f 62",
+      "input_repr": "b'a\\x7fb'",
+      "sanitized_utf8_hex": "61 7f 62",
+      "expected_json_string_content": "ab",
+      "notes": "DEL is valid UTF-8, passed through (not a JSON control char)"
+    },
+    {
+      "id": "valid-utf8-cafe",
+      "input_bytes_hex": "63 61 66 c3 a9",
+      "input_repr": "b'caf\\xc3\\xa9'",
+      "sanitized_utf8_hex": "63 61 66 c3 a9",
+      "expected_json_string_content": "café",
+      "notes": "valid multibyte UTF-8 passes through"
+    },
+    {
+      "id": "utf8-cjk",
+      "input_bytes_hex": "e4 bd a0 e5 a5 bd",
+      "input_repr": "b'\\xe4\\xbd\\xa0\\xe5\\xa5\\xbd'",
+      "sanitized_utf8_hex": "e4 bd a0 e5 a5 bd",
+      "expected_json_string_content": "你好",
+      "notes": "valid 3-byte UTF-8 passes through"
+    },
+    {
+      "id": "utf8-emoji",
+      "input_bytes_hex": "f0 9f 98 80",
+      "input_repr": "b'\\xf0\\x9f\\x98\\x80'",
+      "sanitized_utf8_hex": "f0 9f 98 80",
+      "expected_json_string_content": "😀",
+      "notes": "valid 4-byte UTF-8 passes through"
+    },
+    {
+      "id": "truncated-utf8",
+      "input_bytes_hex": "63 61 66 c3",
+      "input_repr": "b'caf\\xc3'",
+      "sanitized_utf8_hex": "63 61 66 ef bf bd",
+      "expected_json_string_content": "caf�",
+      "notes": "truncated sequence -> one U+FFFD per byte of the incomplete lead"
+    },
+    {
+      "id": "lone-surrogate-utf8",
+      "input_bytes_hex": "ed a0 80",
+      "input_repr": "b'\\xed\\xa0\\x80'",
+      "sanitized_utf8_hex": "ef bf bd ef bf bd ef bf bd",
+      "expected_json_string_content": "���",
+      "notes": "lone surrogate bytes -> three U+FFFD (per-byte resync)"
+    },
+    {
+      "id": "overlong-c0af",
+      "input_bytes_hex": "c0 af",
+      "input_repr": "b'\\xc0\\xaf'",
+      "sanitized_utf8_hex": "ef bf bd ef bf bd",
+      "expected_json_string_content": "��",
+      "notes": "overlong encoding -> two U+FFFD"
+    },
+    {
+      "id": "invalid-lead-0xc0",
+      "input_bytes_hex": "c0",
+      "input_repr": "b'\\xc0'",
+      "sanitized_utf8_hex": "ef bf bd",
+      "expected_json_string_content": "�",
+      "notes": "invalid lead alone -> one U+FFFD"
+    },
+    {
+      "id": "raw-high-byte-0xe9",
+      "input_bytes_hex": "63 61 66 e9",
+      "input_repr": "b'caf\\xe9'",
+      "sanitized_utf8_hex": "63 61 66 ef bf bd",
+      "expected_json_string_content": "caf�",
+      "notes": "raw 0x80-0xFF (#377 case) -> one U+FFFD"
+    },
+    {
+      "id": "raw-high-byte-0x80",
+      "input_bytes_hex": "80",
+      "input_repr": "b'\\x80'",
+      "sanitized_utf8_hex": "ef bf bd",
+      "expected_json_string_content": "�",
+      "notes": "raw high byte alone -> one U+FFFD"
+    },
+    {
+      "id": " Mixed",
+      "input_bytes_hex": "22 00 ff",
+      "input_repr": "b'\"\\x00\\xff'",
+      "sanitized_utf8_hex": "22 00 ef bf bd",
+      "expected_json_string_content": "\\\"\\u0000�",
+      "notes": "quote+control+high byte combination"
+    }
+  ]
+}
