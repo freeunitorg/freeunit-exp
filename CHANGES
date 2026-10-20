@@ -1,6 +1,59 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Change: reproducible builds: with SOURCE_DATE_EPOCH set, unitd, the
+       static libraries, source tarballs, rpm, rust and jar builds no
+       longer carry build paths, host names, kernel release or times.
+       RPM packages built with rpm 4.14 or later have a fixed build time
+       and build host.
+
+    *) Change: configure now stops with an error when the compiler and libc do
+       not provide a working __thread (thread-local storage).  Before,
+       configure used pthread keys instead and gave no warning.  Such a
+       build had no memory pool cluster cache and no thread-local caches
+       for static files.  All supported systems have __thread.  The
+       pthread key code will be removed in a later release.
+
+    *) Feature: --regex-jit enables optional PCRE2 JIT compilation. A
+       library or pattern without usable JIT uses interpreted matching.
+       Configuration cleanup releases JIT executable memory. A match that
+       exhausts the default JIT stack is retried once in the interpreter
+       with the callout budget that the JIT attempt left. This option is
+       off by default.
+
+    *) Bugfix: when a burst of requests arrived for an application with
+       multiple worker processes or threads, only the first request woke a
+       worker, forcing that worker to process the entire burst sequentially
+       while the other workers stayed asleep. If a worker died while
+       holding a notification, subsequent requests could also stall
+       indefinitely. The router now bounds queue notifications by the
+       number of active worker processes and threads, rearms pending
+       requests on worker exit, and workers retry the shared queue on poll
+       timeout.
+
+    *) Bugfix: after 4294705152 requests to one application without a
+       restart, the application queue stopped returning request slots.
+       131072 requests later every request to the application got a 500
+       until the application was restarted. Before 1.37.0 the application
+       and then the router spun at 100% CPU instead. At 5000 requests per
+       second this took ten days. The fix is in unitd and libunit; a Go or
+       Node.js application needs a rebuild against the new libunit.
+
+    *) Bugfix: with "compression" on, a response could reach the client
+       as a corrupt or endless stream. When the response header fields
+       were over about 1 KiB, the first part of the body, up to 16 KiB,
+       went out uncompressed under "Content-Encoding". Python WSGI, Python
+       ASGI, Perl and Ruby applications sent such responses. The bug was
+       in 1.35.0 and later. See
+       https://github.com/freeunitorg/freeunit/issues/666.
+
+    *) Bugfix: a request that arrived while unitd started could hang for
+       ever, and the log showed "get_port_handler: port N:1 not found". A
+       router thread accepted the connection before the router knew the
+       port of that thread. "limits.timeout" did not end such a request.
+       The bug was in 1.19.0 and later. See
+       https://github.com/freeunitorg/freeunit/issues/667.
+
     *) Bugfix: the control API accepted a compression "level" out of the
        range of an integer, such as 2147483648. The router then did not
        apply the "compression" block, and compression was off for the whole
@@ -19,21 +72,37 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        application about the close was lost on a full queue, so the worker
        did not stop; it is now sent again until the queue takes it.
 
-    *) Bugfix: on Linux with a 32-bit glibc, several source files had a
-       32-bit off_t, and the other files had a 64-bit off_t. The files
-       include a system header before nxt_unix.h, which sets
-       _FILE_OFFSET_BITS: nxt_http_compression.c, nxt_zlib.c,
-       nxt_brotli.c, nxt_zstd.c, nxt_upstream_round_robin.c and four
-       libunit test programs. A struct with an off_t then had different
+    *) Bugfix: when the router could not get shared memory for a websocket
+       frame, the log said that a buffer pool was dry. The memory the
+       router uses for frames is not bounded by the application "shm"
+       limit, so a shortage is not what happened. The message now names
+       the bytes that were wanted, the frame size and the connection it
+       costs; the alert logged before it names the cause. See
+       https://github.com/freeunitorg/freeunit/issues/658.
+
+    *) Bugfix: on a system where off_t is 32 bits by default (32-bit
+       Linux with glibc, Solaris, HP-UX and QNX), several source files
+       had a 32-bit off_t, and the other files had a 64-bit off_t. On
+       Linux, Solaris and HP-UX the files include a system header before
+       nxt_unix.h, which sets _FILE_OFFSET_BITS: nxt_http_compression.c,
+       nxt_zlib.c, nxt_brotli.c, nxt_zstd.c, nxt_upstream_round_robin.c
+       and four libunit test programs. On QNX nxt_unix.h does not set
+       the macro at all. A struct with an off_t then had different
        layouts in different files. The "min_length" compression option
        was written as 8 bytes into a 4-byte field, and build/tests
-       crashed. configure now adds -D_FILE_OFFSET_BITS=64 on Linux, and
-       the build fails when off_t does not have the size that configure
-       measured. musl and 64-bit systems were not affected.
+       crashed. configure now adds -D_FILE_OFFSET_BITS=64 on those four
+       systems, and the build fails when off_t does not have the size
+       that configure measured. musl and 64-bit systems were not
+       affected.
 
     *) Bugfix: the record that the cgroup CPU limit lowers the CPU count
        went only to stderr, before the log file was open. It is now written
        to the log file.
+
+    *) Bugfix: unitd read only the first cgroup2 mount in
+       /proc/self/mountinfo. If its root did not contain the cgroup of
+       unitd, the CPU limit was not found. unitd now takes the first
+       cgroup2 mount whose root contains its cgroup.
 
     *) Bugfix: with a 32-bit size_t, the memory pool did not check the sum
        of a large size, its alignment and its block header. An allocation
@@ -222,6 +291,14 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        router does not take them, the request ends with a 503, or with a
        truncated response if the header was already sent.
 
+    *) Bugfix: each thread of unitd now keeps up to 32 freed pool clusters,
+       at most 128 KiB (about 80 KiB with today's pool sizes), for reuse.
+       With musl, the router makes fewer mmap() calls and page faults per
+       request. The cache is off without __thread, under the address,
+       hardware address, memory and thread sanitizers, and with
+       -DNXT_MP_NO_CLUSTER_CACHE=1 or -DNXT_DEBUG_MEMORY=1 in --cc-opt.
+       See https://github.com/freeunitorg/freeunit/issues/688.
+
     *) Change: the Wasmtime library of the wasm module is now built
        without the component-model C API. The module loads core
        WebAssembly modules only and never called that API.
@@ -239,6 +316,93 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        The router sent the first 64 KiB of the message to main and queued
        the rest, but did not ask to be woken up to send it. The bug came
        from NGINX Unit.
+
+    *) Bugfix: a message between two FreeUnit processes could stay queued,
+       and every later message on the same channel waited behind it. This
+       could occur when one thread sent to a full channel at the same time
+       as the thread that owns the channel stopped waiting for it to become
+       writable. The sender did not ask to be woken up again. The bug came
+       from NGINX Unit.
+
+    *) Bugfix: an embedded Python interpreter could load the standard
+       library of another Python. When an application had no "home"
+       option, the interpreter found its prefix through a search for
+       "python3" in PATH. With a Python installed outside the system
+       prefix, a system Python of the same minor version could win, and
+       imports failed for the modules that differed. The interpreter
+       that the module is built against is now recorded at configure
+       time and used as the program name when the application
+       configuration does not set "home", which still wins. If neither
+       that interpreter nor its standard library is there at run time, a
+       warning is logged and PATH is searched as before. The environment,
+       such as PYTHONPATH, is used as before.
+
+    *) Bugfix: when the access log record of a request failed, the router
+       did not close the request. A JS "format" that throws an exception
+       for a request is one cause. The client connection stayed open, and
+       the memory of the request was not freed. The bug had appeared in
+       1.29.0.
+
+    *) Feature: the --usdt configure option adds static USDT probes for
+       bpftrace, perf and SystemTap, with the provider "freeunit". They
+       trace port messages, the app queue, process starts and the start and
+       end of each request. docs/usdt.md lists them, and tools/usdt/ has two
+       bpftrace scripts. A build with the option needs sys/sdt.h. Each probe
+       is a nop until a tracer attaches. Without the option, the probes are
+       not in the build.
+
+    *) Bugfix: a request that a worker took from the shared queue and
+       did not acknowledge could wait for ever. With "limits": {"timeout"}
+       set, the router now logs an alert at the first deadline and answers
+       503 at the second, so the client waits up to two times the timeout.
+       libunit now tells the router when it fails a request before the
+       acknowledgement, and the router answers 503. With the default
+       timeout of 0, three cases still leave the request waiting: a worker
+       that dies between the claim and the acknowledgement, a request that
+       libunit fails while the reply port is not known or not ready, and a
+       request whose GET_PORT cannot be sent. See
+       https://github.com/freeunitorg/freeunit/issues/665.
+
+    *) Change: the PHP module opened an application script with fopen() on
+       every request.  On musl that cost an open, two fcntl() calls and a
+       close per request, because musl's fopen() sets FD_CLOEXEC on the
+       stream after opening it.  The script is now opened by PHP itself,
+       as in PHP-FPM.  "open_basedir" now applies to the main script, a
+       request that names a path which is not a regular
+       file fails instead of running an empty script, the script descriptor
+       is not close-on-exec, and "auto_prepend_file" is listed before the
+       script in get_included_files().  See
+       https://github.com/freeunitorg/freeunit/issues/688.
+
+    *) Bugfix: the PHP module let "display_errors" decide the status of a
+       request whose script PHP could not open.  With "display_errors" on, a
+       script outside "open_basedir" and a path that is not a regular file
+       answered 200 with PHP's warning and the script path in the body; with
+       it off, both answered an empty 500.  A directory or a FIFO at the
+       script path is now refused with 404 before it is opened, which stops
+       a FIFO from parking the worker, and a script outside "open_basedir"
+       gets 403.  The open is nonblocking and the opened file is checked,
+       so replacing a regular script with a FIFO cannot park the worker.
+       Filesystem errors are preserved before PHP resolves the path, so
+       an overlong script path gets 404.  Neither answer carries PHP's
+       diagnostics.  See
+       https://github.com/freeunitorg/freeunit/issues/715.
+
+    *) Bugfix: a PHP POST request without a "Content-Type" header could
+       make PHP read the request body under the content type of the
+       previous request served by the same worker process. The SAPI
+       content_type pointer was not cleared, and it pointed into the
+       request buffer that the worker had already released. PHP now
+       leaves the body for php://input.
+
+    *) Bugfix: tools/unitc ignored the exit status of the program that
+       formats the response. When a request succeeded but the response
+       was not valid JSON, jq or yq printed a parse error and unitc still
+       exited with status 0, so a script could not tell a good response
+       from a broken one. unitc now keeps the status of the filter and
+       exits with 5, naming the format of the response instead of
+       curl(1). A response with no body still exits with 0. See
+       https://github.com/freeunitorg/freeunit/issues/761.
 
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026

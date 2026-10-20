@@ -8,6 +8,7 @@
 #include <nxt_socket_msg.h>
 #include <nxt_port_queue.h>
 #include <nxt_port_memory_int.h>
+#include <nxt_usdt.h>
 
 
 #define NXT_PORT_MAX_ENQUEUE_BUF_SIZE \
@@ -396,6 +397,10 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
             }
 
             if (notify == 0) {
+                if (res == NXT_OK) {
+                    NXT_USDT(port__send, stream, type & NXT_PORT_MSG_MASK);
+                }
+
                 return res;
             }
 
@@ -488,6 +493,14 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
         res = NXT_OK;
     }
 
+    /*
+     * Only an accepted message fires.  The queue branch can turn msg into
+     * a READ_QUEUE marker, so the probe takes the arguments of the call.
+     */
+    if (res == NXT_OK) {
+        NXT_USDT(port__send, stream, type & NXT_PORT_MSG_MASK);
+    }
+
     return res;
 
 queue_broken:
@@ -540,6 +553,29 @@ nxt_port_enqueue_buf(nxt_task_t *task, nxt_port_msg_t *pm, void *qbuf,
               mm->size);
 
     return sizeof(nxt_port_mmap_msg_t);
+}
+
+
+/*
+ * Whether a write to the port would be queued in port->messages rather than
+ * reach the socket: the socket buffer is full or earlier messages are still
+ * waiting for it.  The answer is a snapshot; callers use it only to skip a
+ * message that is redundant while the peer has unread ones (READ_QUEUE).
+ */
+
+nxt_bool_t
+nxt_port_socket_backlogged(nxt_port_t *port)
+{
+    nxt_bool_t  backlogged;
+
+    nxt_thread_mutex_lock(&port->write_mutex);
+
+    backlogged = !port->socket.write_ready
+                 || !nxt_queue_is_empty(&port->messages);
+
+    nxt_thread_mutex_unlock(&port->write_mutex);
+
+    return backlogged;
 }
 
 
@@ -790,7 +826,7 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
      * else's descriptor.
      */
 
-    if (port->announce == 0 || port->pair[1] == -1) {
+    if (nxt_atomic_load(&port->announce) == 0 || port->pair[1] == -1) {
         return NXT_OK;
     }
 
@@ -1208,7 +1244,7 @@ next_fragment:
 
         n = nxt_socketpair_send_ex(&port->socket, msg->fd, iov, sb.niov + 1,
                                    msg->peer_may_be_gone
-                                   || port->quit_sent != 0);
+                                   || nxt_atomic_load(&port->quit_sent) != 0);
 
         if (n > 0) {
             /*
@@ -1404,14 +1440,17 @@ next_fragment:
 
                         /*
                          * Leave the loop the ordinary way instead of raising
-                         * the error handler.  The socket is alive, and the
-                         * ordinary exit re-arms the write event that
-                         * nxt_socketpair_send() just cleared.  Without that
-                         * re-arm, everything queued on this port from here
-                         * on -- including work another thread inserted
-                         * during this send -- would wait for a writable
-                         * event that never comes.
+                         * the error handler, and re-arm.  The socket is
+                         * alive.  nxt_socketpair_send() set write_ready to
+                         * 0, so from here on nxt_port_msg_chk_insert()
+                         * queues what other threads send, and only the
+                         * write handler sends it.  Without a re-arm, that
+                         * work would wait for a writable event that never
+                         * comes.  Re-arm even if the event looks active,
+                         * for the reason given below.
                          */
+
+                        enable_write = 1;
 
                         break;
                     }
@@ -1424,6 +1463,37 @@ next_fragment:
                 msg = qmsg;
 
                 use_delta++;
+
+                /*
+                 * Only the inline call gets here: a message from the queue
+                 * has msg->link.next set.  The message now waits in
+                 * port->messages, and only the write handler sends it.
+                 *
+                 * EAGAIN does not keep the write event armed.
+                 * nxt_socketpair_send() sets only write_ready to 0; it does
+                 * not change the event state.  The edge that comes when the
+                 * peer reads reaches the handler only while the event has
+                 * write interest.  nxt_port_fd_disable_write() removes that
+                 * interest, and with EPOLLET a later readiness gives no
+                 * edge.  After ENOBUFS or ENOMEM the socket is not full, and
+                 * no edge comes at all.
+                 *
+                 * So re-arm even if the event looks active, as on the
+                 * max_share exit above.  The write handler can be on
+                 * port->engine now, between finding the queue empty and
+                 * disabling the event; the test of the event state below
+                 * would then see it active and skip the re-arm, and the
+                 * disable would strand the message.  nxt_port_rearm() posts
+                 * to port->engine, so the re-arm runs after that disable.
+                 *
+                 * Leave the loop here, and do not read write_ready again:
+                 * the poller on port->engine can set it again, and the
+                 * next pass of an inline call would send "data" again.
+                 */
+
+                enable_write = 1;
+
+                break;
             }
         }
 
@@ -1464,7 +1534,7 @@ cleanup:
         if (retry_later) {
             nxt_port_retry_later(task, port);
 
-        } else if (enable_write || port->announce != 0) {
+        } else if (enable_write || nxt_atomic_load(&port->announce) != 0) {
             nxt_port_rearm(task, port);
         }
     }
@@ -2756,6 +2826,10 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
 
                 b = fmsg->buf;
 
+                /* The last fragment: one probe for the whole message. */
+                NXT_USDT(port__recv, fmsg->port_msg.stream,
+                         fmsg->port_msg.type);
+
                 port->handler(task, fmsg);
 
                 /*
@@ -2829,6 +2903,8 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
                     nxt_port_mmap_read(task, msg);
                     b = msg->buf;
                 }
+
+                NXT_USDT(port__recv, msg->port_msg.stream, msg->port_msg.type);
 
                 port->handler(task, msg);
             }

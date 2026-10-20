@@ -10,6 +10,7 @@
 #include "nxt_socket_msg.h"
 #include "nxt_port_queue.h"
 #include "nxt_app_queue.h"
+#include "nxt_usdt.h"
 
 #include "nxt_unit.h"
 #include "nxt_unit_request.h"
@@ -119,6 +120,8 @@ static int nxt_unit_process_req_body(nxt_unit_ctx_t *ctx,
 static int nxt_unit_request_check_response_port(nxt_unit_request_info_t *req,
     nxt_unit_port_id_t *port_id);
 static int nxt_unit_send_req_headers_ack(nxt_unit_request_info_t *req);
+static void nxt_unit_req_headers_fail(nxt_unit_ctx_t *ctx,
+    nxt_unit_recv_msg_t *recv_msg);
 static int nxt_unit_process_websocket(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg);
 static int nxt_unit_process_shm_ack(nxt_unit_ctx_t *ctx);
@@ -1236,7 +1239,7 @@ nxt_unit_process_read_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
 
     pthread_mutex_lock(&ctx_impl->mutex);
 
-    wait = ctx_impl->parked > 0
+    wait = nxt_atomic_load(&ctx_impl->parked) > 0
            || !nxt_queue_is_empty(&ctx_impl->pending_rbuf);
 
     pthread_mutex_unlock(&ctx_impl->mutex);
@@ -1352,6 +1355,9 @@ nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
             if (rc == NXT_UNIT_AGAIN) {
                 recv_msg.fd[0] = -1;
                 recv_msg.fd[1] = -1;
+
+            } else if (port_msg->type == _NXT_PORT_MSG_REQ_HEADERS) {
+                nxt_unit_req_headers_fail(ctx, &recv_msg);
             }
 
             goto done;
@@ -1745,7 +1751,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
         nxt_unit_warn(ctx, "#%"PRIu32": data is not in shared memory",
                       recv_msg->stream);
 
-        return NXT_UNIT_ERROR;
+        goto fail;
     }
 
     if (nxt_slow_path(recv_msg->size < sizeof(nxt_unit_request_t))) {
@@ -1753,7 +1759,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
                       "%d expected", recv_msg->stream, (int) recv_msg->size,
                       (int) sizeof(nxt_unit_request_t));
 
-        return NXT_UNIT_ERROR;
+        goto fail;
     }
 
     /*
@@ -1790,7 +1796,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
             nxt_unit_warn(ctx, "#%"PRIu32": malformed request: fields_count "
                           "%"PRIu32" exceeds buffer", recv_msg->stream,
                           hdr.fields_count);
-            return NXT_UNIT_ERROR;
+            goto fail;
         }
 
         method = nxt_unit_sptr_in_buf(&vr->method, hdr.method_length,
@@ -1820,7 +1826,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
         {
             nxt_unit_warn(ctx, "#%"PRIu32": malformed request: "
                           "sptr out of buffer", recv_msg->stream);
-            return NXT_UNIT_ERROR;
+            goto fail;
         }
 
         /*
@@ -1846,7 +1852,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
                 nxt_unit_warn(ctx, "#%"PRIu32": malformed request: field "
                               "%"PRIu32" sptr out of buffer",
                               recv_msg->stream, i);
-                return NXT_UNIT_ERROR;
+                goto fail;
             }
         }
 
@@ -1869,7 +1875,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
         {
             nxt_unit_warn(ctx, "#%"PRIu32": malformed request: cached field "
                           "index out of range", recv_msg->stream);
-            return NXT_UNIT_ERROR;
+            goto fail;
         }
     }
 
@@ -1878,10 +1884,16 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
         nxt_unit_warn(ctx, "#%"PRIu32": request info allocation failed",
                       recv_msg->stream);
 
-        return NXT_UNIT_ERROR;
+        goto fail;
     }
 
     req = &req_impl->req;
+
+    /*
+     * A new request info does not have this field set, and a released one
+     * has it NULL.  The ERROR path of the check below reads it.
+     */
+    req->response_port = NULL;
 
     req->request = recv_msg->start;
 
@@ -1935,6 +1947,14 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
 
     res = nxt_unit_request_check_response_port(req, &port_id);
     if (nxt_slow_path(res == NXT_UNIT_ERROR)) {
+        /*
+         * libunit has no descriptor for the reply port, so it cannot send
+         * RPC_ERROR.  Release the request now.  Otherwise nxt_unit_quit()
+         * finds it active and sends RPC_ERROR through ->response_port,
+         * which is NULL or a port with no descriptor.
+         */
+        nxt_unit_request_info_release(req);
+
         return NXT_UNIT_ERROR;
     }
 
@@ -1980,6 +2000,12 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
     }
 
     return NXT_UNIT_OK;
+
+fail:
+
+    nxt_unit_req_headers_fail(ctx, recv_msg);
+
+    return NXT_UNIT_ERROR;
 }
 
 
@@ -2149,12 +2175,34 @@ nxt_unit_request_check_response_port(nxt_unit_request_info_t *req,
 
     req->response_port = port;
 
-    pthread_mutex_unlock(&lib->mutex);
-
+    /*
+     * Send GET_PORT with the mutex held, as nxt_unit_quit() sends its QUIT
+     * broadcast.  Then no NEW_PORT for this port can move the request off
+     * ->awaiting_req (nxt_unit_process_awaiting_req()) before a failure is
+     * undone below.
+     */
     res = nxt_unit_get_port(ctx, port_id);
     if (nxt_slow_path(res == NXT_UNIT_ERROR)) {
+        /*
+         * The caller releases the request, so it must not stay on the
+         * port's list.  Remove the port too.  It has no descriptor, and a
+         * later request would find it and wait for a NEW_PORT that was
+         * never asked for.  The request holds the other reference.
+         */
+        nxt_queue_remove(&req_impl->port_wait_link);
+
+        (void) nxt_unit_port_hash_find(&lib->ports, port_id, 1);
+
+        nxt_queue_remove(&port_impl->link);
+
+        pthread_mutex_unlock(&lib->mutex);
+
+        nxt_unit_port_release(port);
+
         return NXT_UNIT_ERROR;
     }
+
+    pthread_mutex_unlock(&lib->mutex);
 
     nxt_atomic_fetch_add(&ctx_impl->wait_items, 1);
 
@@ -2188,6 +2236,85 @@ nxt_unit_send_req_headers_ack(nxt_unit_request_info_t *req)
     }
 
     return NXT_UNIT_OK;
+}
+
+
+/*
+ * A worker that took a request from the shared queue holds it alone: the
+ * router cannot take it back, and it waits for REQ_HEADERS_ACK.  When the
+ * request fails before the acknowledgement, libunit sends RPC_ERROR, the
+ * message that nxt_unit_request_done() sends for a failed request.  The
+ * router then answers 503 and releases the request
+ * (nxt_router_response_error_handler()).  Without this message the router
+ * waits for ever, or until "limits": {"timeout"}.
+ *
+ * The message goes to the reply port of the request.  libunit can send it
+ * only when it knows that port and has its descriptor.  A port that is not
+ * ready has no descriptor yet.
+ *
+ * The message goes to the socket, as the acknowledgement does.  The request
+ * sent nothing before it, so the order of its messages does not matter
+ * here.  Thus every request still sends one datagram (nxt_unit_req_send()).
+ *
+ * Call it once for each failed request, before a request info holds the
+ * stream.  After that, nxt_unit_request_done() answers.
+ */
+
+static void
+nxt_unit_req_headers_fail(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
+{
+    int                   ready;
+    nxt_port_msg_t        msg;
+    nxt_unit_impl_t       *lib;
+    nxt_unit_port_t       *port;
+    nxt_unit_port_id_t    port_id;
+    nxt_unit_port_impl_t  *port_impl;
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    nxt_unit_port_id_init(&port_id, recv_msg->pid, recv_msg->reply_port);
+
+    ready = 0;
+
+    pthread_mutex_lock(&lib->mutex);
+
+    port = nxt_unit_port_hash_find(&lib->ports, &port_id, 0);
+
+    if (port != NULL) {
+        port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
+        ready = port_impl->ready;
+    }
+
+    pthread_mutex_unlock(&lib->mutex);
+
+    if (nxt_slow_path(port == NULL)) {
+        nxt_unit_warn(ctx, "#%"PRIu32": port{%d,%d} is not known, the router "
+                      "is not told of the error", recv_msg->stream,
+                      (int) recv_msg->pid, (int) recv_msg->reply_port);
+        return;
+    }
+
+    if (nxt_slow_path(!ready)) {
+        nxt_unit_warn(ctx, "#%"PRIu32": port{%d,%d} is not ready, the router "
+                      "is not told of the error", recv_msg->stream,
+                      (int) recv_msg->pid, (int) recv_msg->reply_port);
+
+        nxt_unit_port_release(port);
+
+        return;
+    }
+
+    memset(&msg, 0, sizeof(nxt_port_msg_t));
+
+    msg.stream = recv_msg->stream;
+    msg.pid = lib->pid;
+    msg.type = _NXT_PORT_MSG_RPC_ERROR;
+    msg.last = 1;
+
+    (void) nxt_unit_port_send_impl(ctx, port, &msg, sizeof(msg), NULL, 0,
+                                   NULL);
+
+    nxt_unit_port_release(port);
 }
 
 
@@ -2354,6 +2481,18 @@ nxt_unit_process_shm_ack(nxt_unit_ctx_t *ctx)
 }
 
 
+#if (NXT_TESTS)
+static unsigned int  nxt_unit_test_request_info_failure_count;
+
+
+void
+nxt_unit_test_request_info_failures(unsigned int failures)
+{
+    nxt_unit_test_request_info_failure_count = failures;
+}
+#endif
+
+
 static nxt_unit_request_info_impl_t *
 nxt_unit_request_info_get(nxt_unit_ctx_t *ctx)
 {
@@ -2361,6 +2500,13 @@ nxt_unit_request_info_get(nxt_unit_ctx_t *ctx)
     nxt_queue_link_t              *lnk;
     nxt_unit_ctx_impl_t           *ctx_impl;
     nxt_unit_request_info_impl_t  *req_impl;
+
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_unit_test_request_info_failure_count > 0)) {
+        nxt_unit_test_request_info_failure_count--;
+        return NULL;
+    }
+#endif
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
@@ -3358,7 +3504,7 @@ nxt_unit_mmap_buf_send(nxt_unit_request_info_t *req,
                             (int) m.mmap_msg.chunk_id - (int) first_free_chunk);
 
         nxt_unit_debug(req->ctx, "allocated_chunks %d",
-                       (int) lib->outgoing.allocated_chunks);
+                       (int) nxt_atomic_load(&lib->outgoing.allocated_chunks));
 
     } else {
         if (nxt_slow_path(mmap_buf->plain_ptr == NULL
@@ -3966,12 +4112,46 @@ nxt_unit_buf_read(nxt_unit_buf_t **b, uint64_t *len, void *dst, size_t size)
 
 #if (NXT_TESTS)
 static unsigned int  nxt_unit_test_send_detached_failure_count;
+static unsigned int  nxt_unit_test_send_detached_finish_failure_count;
+static unsigned int  nxt_unit_test_send_detached_finish_injected_count;
 
 
 void
 nxt_unit_test_send_detached_failures(unsigned int failures)
 {
     nxt_unit_test_send_detached_failure_count = failures;
+}
+
+
+/*
+ * The same, for the FINISH edge alone.  A test that arms a shared count and
+ * then calls nxt_unit_request_done_detached() never reaches FINISH with
+ * anything left to spend: START is sent first, inside that call, and its
+ * retry loop consumes the count before the handler returns.  FINISH then
+ * goes out on its first attempt and the retry path is not run at all.  The
+ * count here is consumed by FINISH and by nothing else.
+ */
+
+void
+nxt_unit_test_send_detached_finish_failures(unsigned int failures)
+{
+    nxt_unit_test_send_detached_finish_failure_count = failures;
+    nxt_unit_test_send_detached_finish_injected_count = 0;
+}
+
+
+/*
+ * How many FINISH sends the count above has turned into a failure since the
+ * count was last set.  A caller asks after the run: a count armed for n
+ * failures that reports n here failed the FINISH edge n times, and one that
+ * reports less had its failures spent on START, which is sent first and
+ * which a shared count cannot tell apart from FINISH.
+ */
+
+unsigned int
+nxt_unit_test_send_detached_finish_injected(void)
+{
+    return nxt_unit_test_send_detached_finish_injected_count;
 }
 #endif
 
@@ -3989,6 +4169,14 @@ nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state)
 #if (NXT_TESTS)
     if (nxt_slow_path(nxt_unit_test_send_detached_failure_count > 0)) {
         nxt_unit_test_send_detached_failure_count--;
+        return NXT_UNIT_ERROR;
+    }
+
+    if (state == NXT_PORT_DETACHED_FINISH
+        && nxt_slow_path(nxt_unit_test_send_detached_finish_failure_count > 0))
+    {
+        nxt_unit_test_send_detached_finish_failure_count--;
+        nxt_unit_test_send_detached_finish_injected_count++;
         return NXT_UNIT_ERROR;
     }
 #endif
@@ -4959,13 +5147,18 @@ retry:
         }
 
         if (!probe) {
-            hdr->oosm = 1;
+            /*
+             * No data is published with the flag and setting it twice changes
+             * nothing; the clear is the side that uses the compare-and-set
+             * result.
+             */
+            nxt_atomic_store(&hdr->oosm, 1);
         }
     }
 
     if (outgoing_size >= lib->shm_mmap_limit) {
         /* Cannot allocate more shared memory. */
-        lib->shm = NXT_UNIT_SHM_FULL;
+        nxt_atomic_store(&lib->shm, NXT_UNIT_SHM_FULL);
 
         pthread_mutex_unlock(&lib->outgoing.mutex);
 
@@ -4977,7 +5170,8 @@ retry:
             *n = 0;
         }
 
-        if (nxt_slow_path(lib->outgoing.allocated_chunks + min_n
+        if (nxt_slow_path(nxt_atomic_load(&lib->outgoing.allocated_chunks)
+                          + min_n
                           >= lib->shm_mmap_limit * PORT_MMAP_CHUNK_COUNT))
         {
             /* Memory allocated by application, but not send to router. */
@@ -5019,13 +5213,13 @@ skip:
 unlock:
 
     if (nxt_fast_path(hdr != NULL)) {
-        lib->shm = NXT_UNIT_SHM_OK;
+        nxt_atomic_store(&lib->shm, NXT_UNIT_SHM_OK);
 
         nxt_atomic_fetch_add(&lib->outgoing.allocated_chunks, *n);
     }
 
     nxt_unit_debug(ctx, "allocated_chunks %d",
-                   (int) lib->outgoing.allocated_chunks);
+                   (int) nxt_atomic_load(&lib->outgoing.allocated_chunks));
 
     pthread_mutex_unlock(&lib->outgoing.mutex);
 
@@ -5312,8 +5506,9 @@ remove_fail:
 
 fail:
 
-    lib->shm = NXT_UNIT_SHM_FAILED;
-    lib->shm_retry = nxt_unit_detached_now() / 1000 + NXT_UNIT_SHM_RETRY;
+    nxt_atomic_store(&lib->shm, NXT_UNIT_SHM_FAILED);
+    nxt_atomic_store(&lib->shm_retry,
+                     nxt_unit_detached_now() / 1000 + NXT_UNIT_SHM_RETRY);
 
     return NULL;
 }
@@ -5480,14 +5675,14 @@ nxt_unit_get_outgoing_buf(nxt_unit_request_info_t *req, uint32_t size,
         goto plain;
     }
 
-    if (plain_ok && lib->shm == NXT_UNIT_SHM_FAILED) {
+    if (plain_ok && nxt_atomic_load(&lib->shm) == NXT_UNIT_SHM_FAILED) {
         now = nxt_unit_detached_now() / 1000;
 
-        if (now < lib->shm_retry) {
+        if (now < nxt_atomic_load(&lib->shm_retry)) {
             goto plain;
         }
 
-        lib->shm_retry = now + NXT_UNIT_SHM_RETRY;
+        nxt_atomic_store(&lib->shm_retry, now + NXT_UNIT_SHM_RETRY);
     }
 
 #if (NXT_TESTS)
@@ -6178,7 +6373,7 @@ nxt_unit_mmap_release(nxt_unit_ctx_t *ctx, nxt_port_mmap_header_t *hdr,
         nxt_atomic_fetch_add(&lib->outgoing.allocated_chunks, -freed_chunks);
 
         nxt_unit_debug(ctx, "allocated_chunks %d",
-                       (int) lib->outgoing.allocated_chunks);
+                       (int) nxt_atomic_load(&lib->outgoing.allocated_chunks));
     }
 
     if (hdr->dst_pid == lib->pid
@@ -6464,7 +6659,13 @@ nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
         }
     }
 
-    if (ctx_impl->wait_items > 0 || !nxt_unit_chk_ready(ctx)) {
+    if (timeout < 0) {
+        timeout = 1000;
+    }
+
+    if (nxt_atomic_load(&ctx_impl->wait_items) > 0
+        || !nxt_unit_chk_ready(ctx))
+    {
         return nxt_unit_ctx_port_recv(ctx, ctx_impl->read_port, rbuf);
     }
 
@@ -6521,6 +6722,10 @@ retry:
     nevents = poll(fds, nfds, timeout);
 
     if (nxt_slow_path(nevents == 0)) {
+        if (ctx_impl->detached_retries == 0) {
+            goto retry;
+        }
+
         /* A pending FINISH retry bounded the wait; the caller retries. */
         rbuf->size = -1;
 
@@ -6583,7 +6788,8 @@ nxt_unit_chk_ready(nxt_unit_ctx_t *ctx)
 
     return (ctx_impl->ready
             && (lib->request_limit == 0
-                || lib->request_count < lib->request_limit));
+                || nxt_atomic_load(&lib->request_count)
+                   < lib->request_limit));
 }
 
 
@@ -6613,7 +6819,7 @@ nxt_unit_process_pending_rbuf(nxt_unit_ctx_t *ctx)
     for ( ;; ) {
         pthread_mutex_lock(&ctx_impl->mutex);
 
-        if (ctx_impl->parked > 0
+        if (nxt_atomic_load(&ctx_impl->parked) > 0
             || nxt_queue_is_empty(&ctx_impl->pending_rbuf))
         {
             pthread_mutex_unlock(&ctx_impl->mutex);
@@ -7367,7 +7573,7 @@ nxt_unit_ctx_free_rbufs(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl)
     nxt_queue_init(&others);
     nxt_queue_init(&rbufs);
 
-    if (ctx_impl->parked > 0) {
+    if (nxt_atomic_load(&ctx_impl->parked) > 0) {
         pthread_mutex_lock(&lib->incoming.mutex);
 
         end = lib->incoming.elts + lib->incoming.size;
@@ -7400,8 +7606,12 @@ nxt_unit_ctx_free_rbufs(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl)
         nxt_unit_unpark_rbufs(&ctx_impl->ctx, &others);
     }
 
-    /* Another thread may still put buffers of this context in pending_rbuf. */
-    while (ctx_impl->unparking != 0) {
+    /*
+     * Another thread may still put buffers of this context in pending_rbuf.
+     * The acquire load pairs with the full barrier of its decrement, so the
+     * free below comes after the last access of that thread.
+     */
+    while (nxt_atomic_load_acquire(&ctx_impl->unparking) != 0) {
         nxt_thread_yield();
     }
 
@@ -8017,7 +8227,7 @@ nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param)
 
         quit = nxt_queue_is_empty(&ctx_impl->active_req)
                && nxt_queue_is_empty(&ctx_impl->pending_rbuf)
-               && ctx_impl->wait_items == 0
+               && nxt_atomic_load(&ctx_impl->wait_items) == 0
                && ctx_impl->detached == NXT_UNIT_DETACHED_NONE;
 
         pthread_mutex_unlock(&ctx_impl->mutex);
@@ -8210,7 +8420,7 @@ nxt_unit_req_send(nxt_unit_request_info_t *req, const void *buf,
              && (pm->last
                  || req_impl->queue_state == NXT_UNIT_REQ_QUEUED
                  || (req_impl->queue_state == NXT_UNIT_REQ_UNQUEUED
-                     && lib->shm == NXT_UNIT_SHM_OK)));
+                     && nxt_atomic_load(&lib->shm) == NXT_UNIT_SHM_OK)));
 
     if (!queue && req_impl->queue_state == NXT_UNIT_REQ_QUEUED) {
         if (nxt_slow_path(nxt_unit_req_queue_drain(req) != NXT_UNIT_OK)) {
@@ -8728,6 +8938,14 @@ retry:
             return NXT_UNIT_ERROR;
         }
 
+        /*
+         * A READ_QUEUE is a doorbell, not a message: consume it and
+         * "goto retry" to re-check the queue.  A request enqueued without
+         * a doorbell (position at or beyond depth_bound) is still found
+         * here, by this or another worker woken by an earlier doorbell.
+         * Clearing the legacy "notified" flag only matters for an older
+         * router.
+         */
         if (nxt_unit_is_read_queue(rbuf)) {
             nxt_app_queue_notification_received(port_impl->queue);
 
@@ -8866,6 +9084,7 @@ static int
 nxt_unit_app_queue_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf)
 {
+    nxt_atomic_uint_t     count;
     uint32_t              cookie;
     nxt_port_msg_t        *port_msg;
     nxt_app_queue_t       *queue;
@@ -8890,12 +9109,14 @@ retry:
         port_msg = (nxt_port_msg_t *) rbuf->buf;
 
         if (nxt_app_queue_cancel(queue, cookie, port_msg->stream)) {
+            NXT_USDT(queue__dequeue, cookie, port_msg->stream);
+
             lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
             if (lib->request_limit != 0) {
-                nxt_atomic_fetch_add(&lib->request_count, 1);
+                count = nxt_atomic_fetch_add(&lib->request_count, 1) + 1;
 
-                if (nxt_slow_path(lib->request_count >= lib->request_limit)) {
+                if (nxt_slow_path(count >= lib->request_limit)) {
                     nxt_unit_debug(ctx, "request limit reached");
 
                     memset(&m.msg, 0, sizeof(nxt_port_msg_t));
