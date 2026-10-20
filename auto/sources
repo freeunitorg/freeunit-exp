@@ -54,6 +54,7 @@ NXT_LIB_SRCS=" \
     src/nxt_work_queue.c \
     src/nxt_service.c \
     src/nxt_log_moderation.c \
+    src/nxt_limit_zone.c \
     src/nxt_event_engine.c \
     src/nxt_timer.c \
     src/nxt_fd_event.c \
