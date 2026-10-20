@@ -1,8 +1,10 @@
 name: upstream-sync
 
-# Keep the fork's master at upstream freeunitorg/freeunit. A daily fast-forward
-# only: if the fork has diverged, the run fails loudly instead of merging over
-# someone's work, and a human resolves it.
+# Two branches, one direction:
+#   master — a read-only mirror of freeunitorg/freeunit:master; nobody commits to it.
+#   main   — the integration branch where the work happens; it is updated by merging master.
+# Both steps report the SHA before and after; any failure fails the job. A sync that
+# silently does nothing is worse than no sync (it hid a 119-commit drift for a week).
 
 on:
   schedule:
@@ -16,14 +18,48 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Fast-forward master to upstream
+      - name: Mirror upstream into master
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          code=$(gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=master 2>&1) && {
-            echo "$code"
-            exit 0
-          }
-          echo "::warning::upstream-sync did not fast-forward: $code"
-          exit 0
+          sha() { gh api "repos/${{ github.repository }}/git/ref/heads/$1" --jq .object.sha; }
+          before=$(sha master 2>/dev/null || echo none)
+          if ! out=$(gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=master 2>&1); then
+            echo "::error::merge-upstream failed: $out"
+            exit 1
+          fi
+          after=$(sha master)
+          echo "master: ${before} -> ${after}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge master into main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          sha() { gh api "repos/${{ github.repository }}/git/ref/heads/$1" --jq .object.sha; }
+          before=$(sha main)
+          git config user.name  "freeunit-agent[bot]"
+          git config user.email "freeunit-agent[bot]@users.noreply.github.com"
+          git fetch --no-tags origin master:refs/remotes/origin/master
+          if git merge-base --is-ancestor origin/master HEAD; then
+            echo "main already contains master; nothing to merge"
+          else
+            git merge --no-edit origin/master || {
+              echo "::error::merge of master into main conflicted; resolve it by hand"
+              git merge --abort || true
+              exit 1
+            }
+            git push origin HEAD:main || {
+              echo "::error::push to main was rejected (branch rules?) — see the run log"
+              exit 1
+            }
+          fi
+          after=$(sha main)
+          echo "main: ${before} -> ${after}"
