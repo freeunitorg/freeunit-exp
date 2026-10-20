@@ -166,7 +166,7 @@ nxt_limit_lookup(nxt_limit_zone_t *zone, const uint8_t *key, size_t len,
         entry = &zone->entries[link - 1];
 
         if ((size_t) entry->key_len == len
-            && nxt_memcmp(entry->key, key, len) == 0)
+            && (len == 0 || memcmp(entry->key, key, len) == 0))
         {
             return entry;
         }
