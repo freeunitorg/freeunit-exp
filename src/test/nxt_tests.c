@@ -471,6 +471,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_limit_zone_test(thr) != NXT_OK) {
+        return 1;
+    }
+
 #if (NXT_HAVE_OPENSSL)
     if (nxt_openssl_server_init_test(thr) != NXT_OK) {
         return 1;
