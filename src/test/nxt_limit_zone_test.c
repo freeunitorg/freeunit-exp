@@ -32,10 +32,10 @@ nxt_int_t
 nxt_limit_zone_test(nxt_thread_t *thr)
 {
     nxt_mp_t            *mp;
-    nxt_limit_zone_t    *zone, *small;
+    nxt_limit_zone_t    *zone, *small, *capz;
     nxt_uint_t           i;
     u_char               long_key[17];
-    uint64_t             now, cap;
+    uint64_t             now;
 
     mp = nxt_mp_create(1024, 128, 4096, 64);
 
@@ -103,15 +103,33 @@ nxt_limit_zone_test(nxt_thread_t *thr)
                        now) == 1,
                    "a fresh key was rejected");
 
-    /* Tokens never exceed the burst, however long the idle period. */
+    /*
+     * Tokens never exceed the burst, however long the idle period: after an
+     * hour at one token per second a burst-2 zone still passes two requests,
+     * not three thousand six hundred.
+     */
 
-    cap = (uint64_t) zone->burst * NXT_LIMIT_TOKEN_SCALE;
+    capz = nxt_limit_zone_create(mp, 4, 1, 2);
 
-    nxt_limit_zone_check_key(zone, nxt_limit_key_a, now + 3600 * 1000);
+    NXT_TEST_CHECK(thr->log, capz != NULL, "cap zone creation failed");
 
-    NXT_TEST_CHECK(thr->log, (uint64_t) zone->tokens <= cap,
-                   "tokens grew past the burst: %uL, cap %uL",
-                   (uint64_t) zone->tokens, cap);
+    for (i = 0; i < 2; i++) {
+        NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(capz,
+                           nxt_limit_key_c, 0) == 1,
+                       "request %ui inside the cap burst was rejected", i + 1);
+    }
+
+    NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(capz, nxt_limit_key_c,
+                       3600 * 1000) == 1,
+                   "the first request after an idle hour was rejected");
+
+    NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(capz, nxt_limit_key_c,
+                       3600 * 1000) == 1,
+                   "the second request after an idle hour was rejected");
+
+    NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(capz, nxt_limit_key_c,
+                       3600 * 1000) == 0,
+                   "an idle hour accrued more than the burst");
 
     /* An oversized key is not limited: it cannot be stored, so it passes. */
 
