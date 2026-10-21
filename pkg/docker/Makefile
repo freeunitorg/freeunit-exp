@@ -16,6 +16,17 @@ PATCHLEVEL ?= 1
 EOL_JSON := ../eol.json
 eol_versions = $(shell jq -r '.runtimes["$(1)"][].version' $(EOL_JSON) | tr '\n' ' ')
 
+# Optional exact base-image pin per runtime version: an eol.json "pin" on a
+# runtime entry overrides the floating "$(version)" in CONTAINER, so the image
+# builds from a fixed base with no silent patch drift (reproducible builds).
+mod_pin = $(or $(shell jq -r --arg v "$(2)" '.runtimes["$(1)"][]|select(.version==$$v)|.pin // empty' $(EOL_JSON) | head -1),$(2))
+
+# A build-time "apt-get upgrade" ties the image to whatever Debian ships that
+# day, which defeats reproducibility.  It is off for modules that pin their base
+# (php); set NO_UPGRADE_<module> to drop the upgrade step for that module.
+UPGRADE ?= \&\& DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold upgrade
+NO_UPGRADE_php ?= 1
+
 MODULES ?= go java node perl php python ruby wasm
 MODULES_SLIM ?= $(shell jq -r '.runtimes | to_entries[] | select(any(.value[]; .slim==true)) | .key' $(EOL_JSON) | tr '\n' ' ')
 
@@ -62,7 +73,7 @@ MODULE_PREBUILD_perl ?=	/bin/true
 
 VERSIONS_php ?=		$(call eol_versions,php)
 VARIANT_php ?=		cli-$(VARIANT)
-$(foreach phpversion, $(VERSIONS_php), $(eval CONTAINER_php-$(phpversion) = php:$(phpversion)-$(VARIANT_php)))
+$(foreach phpversion, $(VERSIONS_php), $(eval CONTAINER_php-$(phpversion) = php:$(call mod_pin,php,$(phpversion))-$(VARIANT_php)))
 CONFIGURE_php ?=	php
 INSTALL_php ?=		php-install
 RUN_php ?=			ldconfig
@@ -114,6 +125,7 @@ Dockerfile.%: ../../version template.Dockerfile
 			-e 's,@@VERSION@@,$(VERSION),g' \
 			-e 's,@@PATCHLEVEL@@,$(PATCHLEVEL),g' \
 			-e 's,@@CONTAINER@@,$(CONTAINER_$*),g' \
+			-e 's,@@UPGRADE@@,$(if $(NO_UPGRADE_$(call modname, $*)),,$(UPGRADE)),g' \
 			-e 's,@@CONFIGURE@@,$(CONFIGURE_$(call modname, $*)),g' \
 			-e 's,@@INSTALL@@,$(INSTALL_$(call modname, $*)),g' \
 			-e 's,@@RUN@@,$(RUN_$(call modname, $*)),g' \
