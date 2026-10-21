@@ -1,24 +1,27 @@
 # PHP `session.upload_progress`, researcher bugs 109618 / 109619: exposure, the 618 verdict, and a patch-validation test
 
-> Workbench note for freeunit-exp#127. The two labels are the researcher's
-> (CVE-2026-109618, CVE-2026-109619), not NVD assignments. There is no public php-src
-> bug, PR or patch for either as of 2026-10-21, so this note never quotes one.
+> Workbench note for freeunit-exp#127. The researcher labels became real advisories on
+> 2026-10-21: **CVE-2026-109618** (`GHSA-w8hw-w9fx-j79w`, "RCE via OOM corruption") and
+> **CVE-2026-109619** (`GHSA-6wmf-4rv5-p3rp`, "RCE via stale global state"), fixed in PHP
+> 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 by commit `3c832b52` "Avoid state corruption via
+> bailout". Advisory: https://www.php.net/archive/2026.php#2026-10-21-5
 >
-> Every php-src line number below was re-read against the **php-8.4.26 release
-> tarball**, which is also the tree the test was built and run against
-> (`--enable-debug`, `-fsanitize=address`, `--disable-all --enable-cli --enable-session`).
-> The FreeUnit lines are against `88419429e`. Offsets, CVSS values and lab addresses
-> from the writeup are not used anywhere.
+> Two trees are used and always named: **php-8.4.26** (unpatched; the line numbers in
+> sections 1-3 were re-read against that release tarball, and the test was built and run
+> on it) and **php-8.4.27** (the vendor fix; lines used from it are prefixed `8.4.27:`).
+> The FreeUnit lines are against `88419429e`. Offsets, CVSS values and lab addresses from
+> the writeup are not used anywhere.
 
 ## 0. Summary
 
 | Question | Answer |
 |---|---|
-| Is 618 exploitable? | No. Dead by construction: the progress array is addref'd *and* hash-addref'd before it is serialized. The researcher retracted it; the code agrees. |
-| Is 619 real? | Yes: a `memory_limit` bailout leaves `BG(unserialize)` with `level != 0` and `data` pointing into request memory; the next request on the same process reuses that context before `RINIT(basic)` can reset it. Memory-safety, not code execution. |
-| Is FreeUnit exposed? | Yes, the persistent-worker precondition holds and there is no request-count recycle. The precise path differs from the writeup: Unit's PHP SAPI *skips* `php_request_shutdown()` when `php_request_startup()` fails, so the reported "OOM inside the pre-RINIT `update()`" leaves live-but-stale request memory in Unit rather than a freed one. The same UAF is reachable in Unit when the bailout happens **after** RINIT (a script's `session_start()`/`unserialize()`), because then Unit does run `php_request_shutdown()`. Section 2 has the code lines. |
-| Is the test useful? | Yes, and it was proven both ways on 8.4.26: FAIL 3/3 on the unpatched build for both scenarios, PASS 3/3 on each of two independently built fixes (reset before the callback; callback after RINIT). Section 3. |
-| Mitigation | `session.upload_progress.enabled=0` in the application's PHP `admin` options closes the cross-request *reuse* path, not the underlying PHP bug. Section 4. |
+| Is the writeup's 618 (cached pointer) real? | No. The progress array is addref'd *and* hash-addref'd before it is serialized, so the array is live when `var.c:756` runs; the researcher retracted that mechanism. **But the id was reused**: the shipped CVE-2026-109618 is a different, real bug ("RCE via OOM corruption", failed cleanup after a partially initialized request). Do not read the retraction as "109618 is dead". Section 1.3. |
+| Is 619 real? | Yes. A `memory_limit` bailout leaves `BG(unserialize)` with `level != 0` and `data` pointing into request memory; the next request on the same process reuses that context before `RINIT(basic)` can reset it. The vendor rates it **critical RCE** ("RCE via stale global state"); the writeup's CVSS 5.3 was the author's own lab score, not the vendor's. |
+| Is FreeUnit exposed? | Yes. The persistent-worker precondition holds, and Unit does have a reuse bound (`limits.requests`, section 2.1) but it defaults to 0 = no limit. The precise path differs from the writeup: Unit's PHP SAPI *skips* `php_request_shutdown()` when `php_request_startup()` fails, so the reported "OOM inside the pre-RINIT `update()`" leaves live-but-stale request memory in Unit rather than a freed one, and the engine half-initialized. The same UAF is reachable in Unit when the bailout happens **after** RINIT (a script's `session_start()`/`unserialize()`), because then Unit does run `php_request_shutdown()`. Section 2. |
+| Is there a fix? | Yes. PHP 8.4.27/8.5.12 ship it (`3c832b52`). The fix adds `php_basic_early_rinit()` (`8.4.27:ext/standard/basic_functions.c:490-500`) and calls it from `php_request_startup()` before `php_hash_environment()` (`8.4.27:main/main.c:1869`): the reset-before-use shape this note named. It also replaces the OOM bailout with `UnwindExit` and fixes the OOM-cleanup path behind 109618. Section 1.5. |
+| Does the test catch the real fix? | Yes. On 8.4.26 it fails 3/3 (both scenarios); on 8.4.27 it passes 3/3, and it also passed on two local shims. Section 3.3. |
+| Mitigation | Updating the embedded PHP is the only complete fix. The vendor's interim list maps onto Unit: `memory_limit=-1`, `post_max_size`/`upload_max_filesize` bounds, proxy/container limits on decoded size and part counts, `session.upload_progress.enabled=0` applied before request parsing + worker restart, and `limits.requests` as a reuse bound. Section 4. |
 
 ## 1. Established facts, from the 8.4.26 tree
 
@@ -44,7 +47,8 @@ The multipart parser then raises `MULTIPART_EVENT_FILE_START`
 `php_session_initialize()` at `ext/session/session.c:3196`, which reads and decodes the
 session (`ext/session/session.c:502`).
 
-`PHP_RINIT(basic)` — the only place that zeroes the serializer globals — runs later:
+`PHP_RINIT(basic)` — in 8.4.26 the only place that zeroes the serializer globals — runs
+later:
 
     ext/standard/basic_functions.c:391   memset(&BG(serialize), 0, ...);
     ext/standard/basic_functions.c:392   memset(&BG(unserialize), 0, ...);
@@ -79,7 +83,7 @@ matters when reproducing: after the OOM the session file is **gone**, so the nex
 *first* `update()` reads an empty session and the crash happens on a later update in the
 same request (section 3.2).
 
-### 1.3 Why 618 is dead
+### 1.3 618: the writeup's mechanism is dead; the CVE that carries the id is not
 
 The progress array is stored into `$_SESSION` with both an addref and a hash addref:
 
@@ -92,12 +96,21 @@ The line the writeup attributes the stale access to, `ext/standard/var.c:756`
 (call sites `ext/standard/var.c:1029` and `:1080`, both under `php_var_serialize_intern`).
 `data` there is the serializer context (a local `php_serialize_data_t`, live), and `var` is
 the progress array, which `$_SESSION` keeps alive. Nothing in that path touches freed
-memory. Conclusion: 618 is dead by construction, matching the retraction.
+memory. So the *writeup's* 618 mechanism is dead by construction, matching the retraction.
 
-Line drift to note for the record: the writeup cites `session.c:3213/3214`; in 8.4.26 the
-pair is at `3203/3204`. Pin the release you are reading.
+What the shipped CVE-2026-109618 is, is a different bug, and the retraction does not cover
+it. The advisory defines it as "RCE via OOM corruption: out-of-memory handling can interrupt
+PHP while internal request data is only partially initialized. Request cleanup may then
+treat the invalid data as valid." That is the OOM-bailout cleanup class, i.e. the same root
+shape as 619 (a bailout leaves half-initialized state that a later phase consumes), and it
+was fixed in the same commit. Do not reuse this section to say "109618 is not exploitable".
 
-### 1.4 What the pre-RINIT OOM produces, per SAPI
+Line drift to note for the record: the writeup cites `session.c:3213/3214` and `:944`, which
+is what PHP-8.4 commit `294f50b` (2026-10-20) has; the 8.4.26 release has the same
+declarations at `3203/3204` and `940-941`. Both are right for their commit; name the commit
+you read, not "PHP-8.4".
+
+### 1.4 What the pre-RINIT OOM produces, per SAPI (8.4.26, unpatched)
 
 The bailout unwinds to `php_request_startup()`'s `zend_catch` (`main/main.c:1876-1878`),
 which returns `FAILURE`. What the SAPI does next decides whether the stale context becomes
@@ -108,6 +121,35 @@ a use-after-free:
 | cli-server | calls `php_request_shutdown(0)` anyway (`sapi/cli/php_cli_server.c:2311-2312` → `:2245`) | points into **freed** request memory → next request is a UAF |
 | FPM | `php_module_shutdown()` then returns `FPM_EXIT_SOFTWARE` (`sapi/fpm/fpm/fpm_main.c:1871-1876`) | worker exits; availability, not memory safety |
 | FreeUnit PHP | `nxt_unit_request_done(req, NXT_UNIT_ERROR)` and returns, **without** `php_request_shutdown()` (`src/nxt_php_sapi.c:1426-1433`) | still-allocated, stale request memory; engine is left half-initialized (see 2.2) |
+
+### 1.5 What the shipped fix changed
+
+8.4.27 does not move `php_hash_environment()`; it resets the few globals that the pre-RINIT
+path can reach. The new helper is explicit about it:
+
+    # 8.4.27:ext/standard/basic_functions.c:490-500
+    /* Called from php_request_startup(), before any request data is processed. */
+    PHPAPI void php_basic_early_rinit(void)
+    {
+        BG(serialize_lock) = 0;
+        memset(&BG(serialize), 0, sizeof(BG(serialize)));
+        memset(&BG(unserialize), 0, sizeof(BG(unserialize)));
+        php_url_scanner_early_rinit();
+    }
+
+called from `php_request_startup()` at `8.4.27:main/main.c:1869`, before
+`php_hash_environment()` at `:1906`. The same commit replaces the OOM bailout with
+`UnwindExit` and stops the OOM path from running error/cleanup callbacks on half-built
+state, which is the 109618 half of the advisory. Commit `3c832b52` names both GHSAs; the
+message is "Avoid state corruption via bailout".
+
+So the fix is the first shape this note predicted ("reset before use"), not the ordering
+change. That is also why the `.phpt` passes on it unchanged (section 3.3).
+
+`php_hash_environment()` still runs before `zend_activate_modules()`
+(`8.4.27:main/main.c:1906-1907`). The pre-RINIT upload-progress callback still exists; it is
+made safe by the early reset, not by moving the callback. A future change that adds another
+pre-RINIT consumer of `BG(serialize)`/`BG(unserialize)` has to be added to that helper.
 
 ## 2. FreeUnit exposure, from the code
 
@@ -124,9 +166,24 @@ Each request goes through `nxt_php_request_handler()` (`src/nxt_php_sapi.c:1164`
 `sapi_module.read_post` hook (`src/nxt_php_sapi.c:377`, implementation at `:1644`), so the
 pre-RINIT multipart parse in 1.1 happens in Unit exactly as it does elsewhere.
 
-There is no request-count recycle: `grep -rn max_requests src/ lib/` is empty. Unit
-restarts a worker on crash or reconfiguration, not after N requests, so "recycle the
-process" is not an available lever.
+There **is** a request-count recycle, and it defaults to off. The app option is
+`limits.requests` (`src/nxt_conf_validation.c:1415`, validator `:2987-3022`), mapped to
+`nxt_common_app_conf_t.request_limit` (`src/nxt_main_process.c:261-263`) and handed to
+libunit (`src/nxt_application.c:1812` → `src/nxt_unit.c:848`). libunit stops taking work
+once the count reaches the limit:
+
+    src/nxt_unit.c:6780-6782
+        return (ctx_impl->ready
+                && (lib->request_limit == 0
+                    || lib->request_count < lib->request_limit));
+
+and sends a graceful quit when a dequeued request makes the count reach it
+(`src/nxt_unit.c:9101-9114`). `0` (the default) means no limit
+(`src/nxt_conf_validation.c:2987-2990`), so a stock application recycles only on crash or
+reconfiguration. `"limits": {"requests": 1}` is therefore a real lever: one request per
+worker process, which removes the cross-request precondition at the cost of a worker start
+per request. It is a mitigation, not a fix (section 4). The earlier claim that Unit has "no
+`max_requests`" is true only as a grep of that name; the option is `limits.requests`.
 
 ### 2.2 The startup-failure path is different, and is its own thing to fix
 
@@ -203,17 +260,20 @@ forced update at `:3388`), which decodes that progress array with the stale cont
 (default one second, `:949-950`). That is what the stack in 3.3 shows:
 `ps_srlzr_decode_php` → `var_tmp_var` → `tmp_var:168`.
 
-### 3.3 Results on 8.4.26
+### 3.3 Results: 8.4.26 (unpatched) vs 8.4.27 (vendor fix)
 
-Build: `./configure --disable-all --enable-cli --enable-session --enable-debug
-CFLAGS="-O1 -g -fsanitize=address -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address"`,
-then `make -j3`. Run: `TEST_PHP_EXECUTABLE=<build>/sapi/cli/php <build>/sapi/cli/php
-run-tests.php -p <build>/sapi/cli/php docs/exp/php-session-upload-progress-109619.phpt`.
+Both trees were built the same way: `./configure --disable-all --enable-cli
+--enable-session --enable-debug CFLAGS="-O1 -g -fsanitize=address
+-fno-omit-frame-pointer" LDFLAGS="-fsanitize=address"`, then `make -j3`. Run for each:
+`TEST_PHP_EXECUTABLE=<build>/sapi/cli/php <build>/sapi/cli/php run-tests.php -p
+<build>/sapi/cli/php docs/exp/php-session-upload-progress-109619.phpt`.
 
-| Build | pre-rinit | post-rinit | 3 runs |
+| Build | pre-rinit | post-rinit | runs |
 |---|---|---|---|
 | 8.4.26 unpatched | FAIL | FAIL | 3/3 FAIL |
 | 8.4.26 + reset patch (below) | PASS | PASS | 3/3 PASS |
+| **8.4.27 (vendor fix `3c832b52`)** | **PASS** | **PASS** | **3/3 PASS** |
+| 8.4.26 + callback-after-RINIT patch | PASS | PASS | 3/3 PASS |
 
 Unpatched failure output (both scenarios):
 
@@ -289,21 +349,76 @@ Either shape passes; both make the reset happen before any pre-RINIT use of the 
    same way, it passes the test 3/3 as well: with both requests entered after RINIT, the
    globals are reset before either decode.
 
-The test does **not** pass on an unrelated change: it fails on 8.4.26 as shipped, and each
-PASS build differs from it only by one of these two changes.
+The test does **not** pass on an unrelated change: it fails on 8.4.26 as shipped, and it
+passes on the vendor's 8.4.27, which implements shape 1 as `php_basic_early_rinit()`
+(section 1.5). That is the end-to-end proof the task asked for: red on the affected
+release, green on the fixed one, with the same test binary and the same two scenarios.
 
 ## 4. FreeUnit mitigation
 
-`session.upload_progress.enabled` is a `PHP_INI_PERDIR` directive
-(`ext/session/session.c:940-941`). Unit applies per-application PHP options at
-`ZEND_INI_SYSTEM` stage (`src/nxt_php_sapi.c:504-509`, `nxt_php_alter_option()` at
-`:880-907`), validated as a string-valued object
-(`src/nxt_conf_validation.c:1112-1124`, `:4918-4921`). So this is enough:
+### 4.1 The only complete fix: update the embedded PHP
 
+The advisory is explicit: *"while only an update is a complete solution, the following
+measures reduce exposure to specific attack paths but do not make an installation safe."*
+FreeUnit embeds PHP, so it has to ship the fixed module: PHP **8.4.27** (or 8.5.12 for an
+8.5 image; 8.3.36 / 8.2.35 for the older branches; the PHP project also published minimal
+source backports for 7.4/8.0/8.1). The fix is commit `3c832b52`, and section 3.3 shows the
+`.phpt` failing on 8.4.26 and passing on 8.4.27. Rebuilding the PHP module against a fixed
+PHP is the FreeUnit action item; nothing in a configuration file replaces it.
+
+### 4.2 Interim controls, from the advisory, mapped onto Unit
+
+The advisory's 618 list (OOM corruption):
+
+* `memory_limit=-1`, enforced where the application cannot override it, and check nothing
+  puts a finite limit back. In Unit this is a PHP option at application level
+  (`options.admin`/`options.file`, section 4.3); it removes the controllable OOM, but an
+  underlying allocation failure can still reach the path.
+* Low `post_max_size` (8M without uploads, 32M with) with `upload_max_filesize` below it.
+  Unit's own equivalent body bound is `settings.max_body_size`, default **8 MiB**
+  (`src/nxt_router.c:3457`), enforced while the body is read
+  (`src/nxt_http_request.c:222-240`). It bounds the *body*, not the memory a decode
+  allocates from a stored session: the repro in section 3 drives the OOM from a 10 MiB
+  session file that the body cap never sees. So it is a partial control, not the same
+  knob.
+* Server/proxy limits on decoded request size, input field count, multipart part count,
+  header count and nesting depth, including requests without a usable `Content-Length`.
+  Unit has no field-count, part-count or nesting-depth limit, so that half is an external
+  proxy or the application.
+* A container/cgroup limit as an availability boundary that kills only the worker; not
+  `RLIMIT_AS`/`RLIMIT_DATA` (the advisory says those can cause the vulnerable allocation
+  failure). Unit runs workers in their own process namespaces and supports container
+  deployment, so this is available, but it is availability, not safety.
+
+The advisory's 619 list (stale global state):
+
+* `session.upload_progress.enabled=0`, applied **before request parsing** (php.ini, pool or
+  server configuration), then restart every worker; do not rely on `ini_set()` or FPM
+  `.user.ini`. Unit's `options.admin`/`options.file` are applied when the module starts and
+  before any request (`src/nxt_php_sapi.c:504-509`, `:880-907`), which satisfies "before
+  request parsing"; `options.user` is the wrong place for this class of setting. The
+  directive itself is `PHP_INI_PERDIR` (`ext/session/session.c:940-941`), and with
+  `PS(rfc1867_enabled)` false the pre-RINIT callback returns at
+  `ext/session/session.c:3236-3238` before any session decode, so a stale
+  `BG(unserialize)` is never consumed. The advisory calls this "blocks the confirmed
+  session paths but not other variants".
+* On PHP 8.5, `fatal_error_backtraces=0` (blocks the confirmed fatal-backtrace path only).
+* Remove invalid/deprecated per-request settings that emit diagnostics before
+  initialization; do not hide diagnostics with `error_reporting`/`display_errors`/`@`.
+* Fix attacker-reachable fatal errors and execution timeouts in the application.
+
+### 4.3 Unit configuration shape
+
+    "settings": {
+        "http": {
+            "max_body_size": 8388608
+        }
+    },
     "applications": {
         "app": {
             "type": "php",
             "root": "/var/www/app",
+            "limits": { "requests": 0 },
             "options": {
                 "admin": {
                     "session.upload_progress.enabled": "0"
@@ -312,41 +427,53 @@ PASS build differs from it only by one of these two changes.
         }
     }
 
-What it closes: with `PS(rfc1867_enabled)` false, the pre-RINIT callback returns at
-`ext/session/session.c:3236-3238` before any session decode, so a stale
-`BG(unserialize)` is never used before `RINIT(basic)` resets it. Both scenarios in
-section 3 depend on that pre-RINIT decode, so both are closed. It also removes the
-`session.upload_progress` OOM bailout itself.
+* `session.upload_progress.enabled` in `options.admin` is applied at module start, before
+  requests, and the value is stored in the session module (the directive's update handler
+  runs); it is not a runtime `ini_set()`. A php.ini named by `options.file` is equivalent
+  for this directive and is what the advisory's wording prefers, but on a host with a
+  `PHP_INI_SCAN_DIR` a later scan-dir file can override the named file, so verify the
+  effective value per worker instead of assuming it.
+* `limits.requests` (`src/nxt_conf_validation.c:1415`, `:2987-3022`; enforced at
+  `src/nxt_unit.c:6780-6782`, `:9101-9114`) bounds worker reuse: `1` means one request per
+  worker process, which breaks the cross-request precondition outright. The default `0`
+  means no limit. It is a real lever, at a worker-start cost per request, and it is still
+  not a fix: a single request can reach the 109618 OOM-cleanup path.
+* Unit has no `max_requests` by that name; the option above is the one to use. The earlier
+  text in this note that said there is no recycle lever was wrong, and the review of the
+  companion PR flagged the same thing.
 
-What it does not close:
+### 4.4 What none of this closes
 
-* The PHP engine bug. A post-RINIT bailout still leaves `BG(unserialize)` dangling; it
-  just has no pre-RINIT consumer left. Any future pre-RINIT unserialize consumer would
-  reopen it.
-* Availability: an attacker who can make a request OOM in `session_start()` /
-  `unserialize()` can still fail requests. That is not fixed by this ini.
-* The multipart-parser path the researcher warns about ("limit size and body on every
-  part"): request-body handling before/around the upload callback is not governed by this
-  directive. That is edge proxy/WAF work, not a FreeUnit configuration change.
-* Process recycling: Unit has no `max_requests`, so there is no per-request recycle lever
-  to fall back on until a PHP fix ships.
+* The engine bugs. Interims reduce reachable paths; `limits.requests: 1` and
+  `session.upload_progress.enabled=0` together remove the cross-request reuse, but a single
+  OOM request can still hit the 109618 cleanup path.
+* Availability without `memory_limit=-1`: an attacker who can make a request OOM can still
+  fail requests.
+* The session-file amplification: no body or part limit bounds the memory a session decode
+  allocates (section 4.2).
 
-Until a PHP release carries a fix, this is a mitigation, not a fix, and it should be
+Until the embedded PHP is 8.4.27 or newer, all of the above is a mitigation, and should be
 documented as such wherever FreeUnit PHP guidance lives.
 
 ## 5. Do not claim
 
-* That 618 is exploitable. It is not: `session.c:3203/3204` keep the array alive, and
-  `var.c:756` runs on the serialize side over live memory.
-* That 619 is code execution. It is a use-after-free/SEGV in a persistent worker
-  (memory safety, the researcher's own rating is 5.3).
-* That FreeUnit is safe. The precondition holds and there is no recycle knob. The exact
-  startup-failure path differs from cli-server, and that difference is an unmeasured Unit
-  bug of its own, not a protection.
-* That the ini mitigation is a fix.
-* That this note reproduces the researcher's lab (FPM/WordPress): it reproduces the
-  php-src defect on 8.4.26 under the cli-server, which is the SAPI the php-src test runner
-  can drive and the one that exhibits the free-then-reuse sequence.
+* That 109618 is not exploitable. Only the *writeup's cached-pointer mechanism* is dead
+  (`session.c:3203/3204`, `var.c:756` on the serialize side). The shipped CVE-2026-109618 is
+  a different, real OOM-corruption bug and is rated critical RCE by the vendor.
+* That 619 is "CVSS 5.3, memory safety only". The 5.3 was the researcher's own lab score.
+  The vendor rates CVE-2026-109619 critical RCE ("RCE via stale global state").
+* That FreeUnit is safe, or that it is out of scope because it is not in the vendor's list
+  of named SAPIs. It is not named, and it is in the exposed class.
+* That an edge cap or `max_body_size` fully blocks the attack. The advisory calls these
+  exposure reducers, "not complete"; the repro's OOM comes from the session decode, which a
+  body cap does not bound.
+* That `session.upload_progress.enabled=0` is a fix. It is an interim that the advisory
+  scopes to "the confirmed session paths but not other variants".
+* That the ini, `limits.requests: 1` or both make an unpatched PHP safe. They are
+  unavailable as a substitute for updating.
+* That this note reproduces the researcher's lab (FPM/WordPress): it reproduces the php-src
+  defect on 8.4.26 under the cli-server, which is the SAPI the php-src test runner can drive
+  and the one that exhibits the free-then-reuse sequence.
 * Any writeup offset, CVSS value or heap address from the public post; none of it is used
   or needed here.
 
@@ -354,15 +481,17 @@ documented as such wherever FreeUnit PHP guidance lives.
 
 | File | What it is |
 |---|---|
-| `docs/exp/php-session-upload-progress-109619.phpt` | the regression test: two scenarios, fails on 8.4.26, passes on a fix |
-| this note | exposure verdict, 618 dead note, test design, results, mitigation |
+| `docs/exp/php-session-upload-progress-109619.phpt` | the regression test: two scenarios, FAILS on 8.4.26, PASSES on 8.4.27 (and on two local shims) |
+| this note | exposure verdict, 618 mechanism vs CVE, test design and results, the shipped fix, mitigation |
 
-Reproduce (outside the repository, with a disposable build):
+Reproduce the pair (outside the repository, with disposable builds):
 
-    curl -LO https://www.php.net/distributions/php-8.4.26.tar.gz
-    tar xzf php-8.4.26.tar.gz && cd php-8.4.26
-    ./configure --disable-all --enable-cli --enable-session --enable-debug \
-        CFLAGS="-O1 -g -fsanitize=address -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address"
-    make -j3
-    TEST_PHP_EXECUTABLE=$PWD/sapi/cli/php $PWD/sapi/cli/php run-tests.php \
-        -p $PWD/sapi/cli/php <path>/php-session-upload-progress-109619.phpt
+    for v in 8.4.26 8.4.27; do
+        curl -LO https://www.php.net/distributions/php-$v.tar.gz
+        tar xzf php-$v.tar.gz && ( cd php-$v
+        ./configure --disable-all --enable-cli --enable-session --enable-debug \
+            CFLAGS="-O1 -g -fsanitize=address -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address"
+        make -j3
+        TEST_PHP_EXECUTABLE=$PWD/sapi/cli/php $PWD/sapi/cli/php run-tests.php \
+            -p $PWD/sapi/cli/php <path>/php-session-upload-progress-109619.phpt )   # FAIL, then PASS
+    done

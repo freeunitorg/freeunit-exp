@@ -33,7 +33,8 @@ if (!str_contains($maps, 'libasan') && !str_contains($maps, 'libclang_rt.asan'))
  *
  * On unpatched PHP 8.4 each scenario kills the server; the fix (reset the
  * serializer globals before the pre-RINIT callback may use them) keeps both
- * servers alive.
+ * servers alive.  Verified: red on 8.4.26, green on 8.4.27, which ships
+ * php_basic_early_rinit() for exactly this.
  */
 
 const PAYLOAD = 10 << 20;   /* session payload bigger than memory_limit */
