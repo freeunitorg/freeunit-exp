@@ -6,6 +6,8 @@
 #include <nxt_router.h>
 #include <nxt_http.h>
 #include <nxt_http_compression.h>
+#include <nxt_conn.h>
+#include <nxt_h1proto.h>
 
 
 typedef struct {
@@ -250,6 +252,12 @@ static void nxt_http_static_buf_completion(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_http_static_buf_cleanup(nxt_task_t *task, void *obj,
     void *data);
+
+static void nxt_http_static_file_body_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_http_static_file_completion(nxt_task_t *task, void *obj,
+    void *data);
+static nxt_bool_t nxt_http_static_sendfile(nxt_http_request_t *r);
 
 static nxt_int_t nxt_http_static_mtypes_hash_test(nxt_lvlhsh_query_t *lhq,
     void *data);
@@ -1229,7 +1237,20 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
                 goto fail;
             }
 
-            body_handler = &nxt_http_static_body_handler;
+            /*
+             * When the connection can send a file buffer, the file goes to the
+             * write path as one and the payload moves from the file into the
+             * socket without the two 128 KiB copies the memory path below
+             * makes: with sendfile() on a plain connection, with SSL_sendfile()
+             * on a connection whose kernel TLS is active.  Every other case
+             * keeps the memory path.
+             */
+            if (nxt_http_static_sendfile(r)) {
+                body_handler = &nxt_http_static_file_body_handler;
+
+            } else {
+                body_handler = &nxt_http_static_body_handler;
+            }
 
         } else {
             nxt_file_close(task, f);
@@ -1938,6 +1959,119 @@ extension:
 
     exten->length = end - p;
     exten->start = p;
+}
+
+
+/*
+ * Whether this request's response body can go to the write path as a file
+ * buffer: HTTP/1 on a plain connection, or HTTP/1 on a TLS connection whose
+ * kernel TLS is active.  Checked once per response, before a file buffer is
+ * handed over.
+ */
+
+static nxt_bool_t
+nxt_http_static_sendfile(nxt_http_request_t *r)
+{
+#if (NXT_TLS)
+    nxt_conn_t  *c;
+#endif
+
+    if (r->protocol != NXT_HTTP_PROTO_H1) {
+        return 0;
+    }
+
+    if (!r->tls) {
+        /*
+         * A plain connection always can: nxt_conn_io_sendbuf() hands a buffer
+         * that holds only a file to nxt_conn_io_sendfile(), which is sendfile()
+         * or its platform equivalent.
+         */
+        return 1;
+    }
+
+#if (NXT_TLS)
+    c = r->proto.h1->conn;
+
+    /*
+     * With TLS the file only saves the copies when the record encryption is in
+     * the kernel as well, otherwise the payload returns to user space for
+     * SSL_write() and the file buffer buys nothing.
+     */
+    return (c->io->sendfile_ready != NULL)
+           && c->io->sendfile_ready(c);
+#else
+    return 0;
+#endif
+}
+
+
+/*
+ * Sends the whole file as one file buffer.  The last marker follows it in the
+ * chain, so the response ends when the buffer has been sent, and the
+ * completion handler below closes the file at that point.
+ */
+
+static void
+nxt_http_static_file_body_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *fb;
+    nxt_http_request_t  *r;
+
+    r = obj;
+    fb = r->out;
+
+    nxt_debug(task, "http static file body fd:%d", fb->file->fd);
+
+    /*
+     * The buffer has carried only bookkeeping until now: nxt_buf_is_file() is
+     * the NXT_BUF_FILE flag on the buffer, and nxt_http_static_buf_alloc()
+     * returns a zeroed one.  Without the flag the write path reads the buffer
+     * as a sync marker and the response ends with no body at all.
+     */
+    nxt_buf_set_file(fb);
+
+    fb->completion_handler = nxt_http_static_file_completion;
+    fb->parent = r;
+    fb->next = nxt_http_buf_last(r);
+
+    /*
+     * The completion handler reads r->out when the buffer has been sent or
+     * discarded, and that can happen after the request itself is done.  The
+     * memory path holds the pool for each of its buffers for the same reason.
+     */
+    nxt_mp_retain(r->mem_pool);
+
+    nxt_http_request_send(task, r, fb);
+}
+
+
+/*
+ * Runs when the file buffer has been sent, or when the response is discarded.
+ * Clearing r->out before the buffer is reclaimed is what makes
+ * nxt_http_static_buf_cleanup() a no-op instead of a second close.
+ */
+
+static void
+nxt_http_static_file_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *fb;
+    nxt_http_request_t  *r;
+
+    fb = obj;
+    r = data;
+
+    nxt_debug(task, "http static file completion fd:%d pos:%O end:%O",
+              fb->file->fd, fb->file_pos, fb->file_end);
+
+    nxt_file_close(task, fb->file);
+
+    if (r->out == fb) {
+        r->out = NULL;
+    }
+
+    nxt_http_static_buf_free(fb);
+
+    nxt_mp_release(r->mem_pool);
 }
 
 
