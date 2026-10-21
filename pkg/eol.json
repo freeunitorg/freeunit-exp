@@ -70,9 +70,9 @@
       {"version": "5.44", "eol": "2029-07", "supported_until": "2030-07"}
     ],
     "php": [
-      {"version": "8.3", "eol": "2027-12", "supported_until": "2028-12"},
-      {"version": "8.4", "eol": "2028-12", "supported_until": "2029-12"},
-      {"version": "8.5", "eol": "2029-12", "supported_until": "2030-12"}
+      {"version": "8.3", "eol": "2027-12", "supported_until": "2028-12", "pin": "8.3.36"},
+      {"version": "8.4", "eol": "2028-12", "supported_until": "2029-12", "pin": "8.4.27"},
+      {"version": "8.5", "eol": "2029-12", "supported_until": "2030-12", "pin": "8.5.12"}
     ],
     "python": [
       {"version": "3.12", "eol": "2028-10", "supported_until": "2029-10", "slim": true},
