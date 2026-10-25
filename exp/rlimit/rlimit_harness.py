@@ -12,6 +12,7 @@ where a cell cannot be run on this host.
 """
 import argparse
 import array
+import ctypes
 import json
 import os
 import resource
@@ -23,9 +24,17 @@ import time
 ROWS = []
 
 
-def emit(cell, expectation, observed, verdict, note=""):
+def emit(cell, expectation, observed, verdict, note="", gate=True):
+    """Record one row. `gate=False` marks a FINDING: it is reported, never gated.
+
+    A finding is a libc-dependent behaviour the harness measures; a control is a
+    probe whose agreement with its case would mean the probe sees nothing. Only
+    controls may fail `--self-test`.
+    """
     ROWS.append({"cell": cell, "expectation": expectation,
-                 "observed": observed, "verdict": verdict, "note": note})
+                 "observed": observed, "verdict": verdict, "note": note,
+                 "gate": gate})
+
 
 
 def in_child(fn):
@@ -74,21 +83,30 @@ def _fill_fds(keep, extra=0):
 def cell_inflight(sender_limit, extra=8, drain=False):
     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     ready_r, ready_w = os.pipe()
+    ack_r = ack_w = -1
+    if drain:
+        ack_r, ack_w = os.pipe()             # child -> parent: "that one is drained"
     pid = os.fork()
     if pid == 0:
         os.close(parent.fileno())
         os.close(ready_r)
+        if drain:
+            os.close(ack_r)
         os.write(ready_w, b"1")              # "I am in the loop" — removes the race
         if drain:
-            while True:                      # keep the queue empty: nothing stays in flight
+            while True:                      # keep the queue empty, one message per ack
                 try:
                     child.recv(8)
                 except OSError:
                     break
-        time.sleep(2)                        # never recv: descriptors stay in flight
+                os.write(ack_w, b"1")
+        else:
+            time.sleep(2)                    # never recv: descriptors stay in flight
         os._exit(0)
     os.close(child.fileno())
     os.close(ready_w)
+    if drain:
+        os.close(ack_w)
     os.read(ready_r, 1)
     os.close(ready_r)
     os.set_blocking(parent.fileno(), False)
@@ -101,13 +119,21 @@ def cell_inflight(sender_limit, extra=8, drain=False):
         try:
             parent.sendmsg([b"x"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])
             sent += 1
+            # Wait for the drain before the next send: a burst the receiver has not
+            # been scheduled to drain yet is in flight by definition, and that race
+            # made this control fail one run in three with the case's own numbers.
+            if drain and os.read(ack_r, 1) != b"1":
+                break
         except OSError as e:
             err = e
             break
     os.kill(pid, 9)
     os.waitpid(pid, 0)
+    if drain:
+        os.close(ack_r)
     resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))           # restore
     return sent, err
+
 
 
 def run_inflight():
@@ -189,38 +215,57 @@ def run_as():
 
 
 # ---------------------------------------------------------------- cell 4: stack
+_libc = None
+
+
+def thread_stack_bounds():
+    """(start, size) of the CALLING thread's own stack, as libc reports it."""
+    global _libc
+    if _libc is None:
+        _libc = ctypes.CDLL(None, use_errno=True)
+        _libc.pthread_self.restype = ctypes.c_void_p
+    attr = ctypes.create_string_buffer(256)          # pthread_attr_t, zeroed
+    rc = _libc.pthread_getattr_np(ctypes.c_void_p(_libc.pthread_self()), attr)
+    if rc:
+        raise OSError(rc, "pthread_getattr_np")
+    start, size = ctypes.c_void_p(), ctypes.c_size_t()
+    rc = _libc.pthread_attr_getstack(attr, ctypes.byref(start), ctypes.byref(size))
+    if rc:
+        raise OSError(rc, "pthread_attr_getstack")
+    return start.value, size.value
+
+
 def stack_mapping_size(explicit=None):
-    """Size of the largest new anonymous rw mapping created for one live thread."""
+    """Size of one new worker thread's stack, measured from inside that thread.
+
+    libc names the thread's own stack. A diff of /proc/self/maps does not: it
+    takes the largest newly-appeared rw-p range and can pick a range that is not
+    the stack at all — that method reported 16904K for a 512K request on glibc.
+    """
     if explicit:
         threading.stack_size(explicit)
 
-    def maps():
-        out = {}
-        with open("/proc/self/maps") as fh:
-            for ln in fh:
-                parts = ln.split()
-                out[parts[0]] = parts[1]
-        return out
-
-    before = maps()
     stop = threading.Event()
+    got = {}
 
     def worker():
-        stop.wait(20)
+        try:
+            got["size"] = thread_stack_bounds()[1]
+        except OSError as exc:
+            got["err"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            stop.wait(20)
 
     th = threading.Thread(target=worker, daemon=True)
     th.start()
-    time.sleep(0.2)
-    after = maps()
+    deadline = time.time() + 10
+    while not got and time.time() < deadline:
+        time.sleep(0.01)
     stop.set()
     th.join()
-    sizes = []
-    for rng, perm in after.items():
-        if rng in before or perm != "rw-p":
-            continue
-        lo, hi = rng.split("-")
-        sizes.append(int(hi, 16) - int(lo, 16))
-    return max(sizes) if sizes else 0
+    if "size" not in got:
+        raise OSError(got.get("err", "worker never started"))
+    return got["size"]
 
 
 def run_stack():
@@ -234,12 +279,19 @@ def run_stack():
     restored = stack_mapping_size()
     explicit = stack_mapping_size(512 * 1024)
     threading.stack_size(0)
-    emit("stack-musl", "thread stack does not follow RLIMIT_STACK",
-         f"default={default//1024}K lowered={lowered//1024}K restored={restored//1024}K",
-         "PASS" if default == lowered == restored else "FAIL (glibc-like or clamp)")
+    # A FINDING, not a control: musl gives every thread one fixed-size stack, glibc
+    # takes the soft RLIMIT_STACK at thread creation. Which one this host does is
+    # the measurement, so the row never fails the run.
+    same = default == lowered == restored
+    emit("stack-libc", "musl ignores RLIMIT_STACK for thread stacks; glibc reads it at thread creation",
+         f"default={default//1024}K lowered={lowered//1024}K restored={restored//1024}K "
+         f"rlimit_soft={saved[0]//1024}K",
+         "PASS" if same else "FINDING: stack follows RLIMIT_STACK",
+         note="" if same else "libc-dependent", gate=False)
     emit("stack-method-control", "an explicit 512K stack is visible to the method",
          f"explicit={explicit//1024}K default={default//1024}K",
          "PASS" if 0 < explicit < default else "FAIL: method cannot see a stack")
+
 
 
 # ---------------------------------------------------------------- cell 5: soft/hard
@@ -279,9 +331,11 @@ def main():
     else:
         for r in ROWS:
             print(f"{r['cell']:<22} {r['verdict']:<6} {r['observed']}"
-                  + (f"  [{r['note']}]" if r["note"] else ""))
+                  + (f"  [{r['note']}]" if r["note"] else "")
+                  + ("" if r.get("gate", True) else "  (finding, not gated)"))
 
-    fails = [r for r in ROWS if r["verdict"].startswith("FAIL")]
+    fails = [r for r in ROWS
+             if r.get("gate", True) and r["verdict"].startswith("FAIL")]
     if args.self_test and fails:
         print(f"\nSELF-TEST FAILED: {len(fails)} control(s) did not distinguish: "
               f"{[r['cell'] for r in fails]}", file=sys.stderr)

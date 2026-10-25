@@ -67,6 +67,34 @@ Two measured details that decide test assertions:
 - **macOS/xnu** externalizes SCM rights before measuring the receive buffer, so a
   short receive there does not report `MSG_CTRUNC`.
 
+### OpenBSD and macOS
+
+- **OpenBSD** — nine resources only: `CORE`, `CPU`, `DATA`, `FSIZE`, `MEMLOCK`,
+  `NOFILE`, `NPROC`, `RSS`, `STACK` (`getrlimit(2)`, man.openbsd.org). There is
+  **no `RLIMIT_AS`**: `RLIMIT_DATA` is the address-space knob and by the manual's
+  own wording covers `malloc()` and all anonymous `mmap()`. `RLIMIT_RSS` is "no
+  longer enforced, but retained for compatibility", and `RLIMIT_STACK` "is only
+  used by the main thread". `RLIMIT_NPROC` is charged per uid in `fork1()`
+  (`sys/kern/kern_fork.c`), while `pthread_create` reaches `thread_fork()` through
+  `sys___tfork` and meets only the global `kern.maxthread` check — so **threads do
+  not count against `NPROC`**.
+- **macOS (xnu)** — nine resources, and two silent clamps. `RLIMIT_NOFILE`: the
+  kernel enforces `MIN(rlimit, kern.maxfilesperproc)` (`kern_resource.c`), and
+  `maxfilesperproc` defaults to `OPEN_MAX`, so asking for more than the sysctl is
+  silently ineffective. `RLIMIT_NPROC`: `setrlimit()` clamps the value to
+  `maxprocperuid` — `maxproc` for root — so the number you set is not necessarily
+  the number in force. `RLIMIT_AS` is real (`vm_map_set_size_limit`), but a value
+  below current usage fails with `EINVAL`, and `RLIMIT_RSS` is a **source
+  compatibility alias** of `RLIMIT_AS` (`bsd/sys/resource.h`) — two names, one
+  limit. `RLIMIT_MEMLOCK` sets the Mach VM wire limit. Thread creation does not
+  charge `RLIMIT_NPROC`: `bsd/kern/kern_thread.c` has no `chgproccnt` call.
+- Common to OpenBSD, FreeBSD and macOS: **`RLIMIT_NPROC` counts processes, not
+  threads.** Only Linux charges threads against it. A shared `nproc` knob would
+  therefore mean two different things across the platforms this project builds on.
+- Build status: macOS is in CI (`build-test-macos.yml`, `macos-15`); OpenBSD has a
+  configure branch (`auto/os/conf`, `kqueue` engine) and **no CI job**, so every
+  OpenBSD statement here is source-read.
+
 ## 4. Containers: the rlimit is usually not the governor
 
 Measured in a Docker container on this host: `Max open files 4096/524288`,
