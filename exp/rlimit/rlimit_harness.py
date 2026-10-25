@@ -37,6 +37,24 @@ def emit(cell, expectation, observed, verdict, note="", gate=True):
 
 
 
+def set_soft(res, value):
+    """Set a soft limit, leaving the hard limit usable.
+
+    Passing the hard limit back verbatim is not portable: macOS rejects
+    RLIM_INFINITY as an explicit hard value, and lowering a hard limit to the new
+    soft value is irreversible. So try the current hard value, then a finite one.
+    """
+    _, hard = resource.getrlimit(res)
+    last = None
+    for candidate in (hard, max(value, 1 << 40)):
+        try:
+            resource.setrlimit(res, (value, candidate))
+            return
+        except (ValueError, OSError) as exc:
+            last = exc
+    raise last
+
+
 def in_child(fn):
     """Run fn in a forked child and carry the rows it produced back to the parent.
 
@@ -110,8 +128,7 @@ def cell_inflight(sender_limit, extra=8, drain=False):
     os.read(ready_r, 1)
     os.close(ready_r)
     os.set_blocking(parent.fileno(), False)
-    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
-    resource.setrlimit(resource.RLIMIT_NOFILE, (sender_limit, hard))   # soft only
+    set_soft(resource.RLIMIT_NOFILE, sender_limit)
     devnull = os.open("/dev/null", os.O_RDONLY)
     fds = array.array("i", [devnull])
     sent, err = 0, None
@@ -131,7 +148,6 @@ def cell_inflight(sender_limit, extra=8, drain=False):
     os.waitpid(pid, 0)
     if drain:
         os.close(ack_r)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))           # restore
     return sent, err
 
 
@@ -198,9 +214,8 @@ def run_ctrunc():
 # ---------------------------------------------------------------- cell 3: AS
 def cell_as(limit, want):
     import mmap
-    hard = resource.getrlimit(resource.RLIMIT_AS)[1]
     if limit is not None:
-        resource.setrlimit(resource.RLIMIT_AS, (limit, hard))   # soft only
+        set_soft(resource.RLIMIT_AS, limit)
     chunks, got = [], 0
     try:
         while got < want:
@@ -211,7 +226,10 @@ def cell_as(limit, want):
         return got, type(exc).__name__
     finally:
         if limit is not None:
-            resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+            try:
+                set_soft(resource.RLIMIT_AS, resource.RLIM_INFINITY)
+            except (ValueError, OSError):
+                pass
 
 
 def run_as():
@@ -279,7 +297,7 @@ def stack_mapping_size(explicit=None):
     def worker():
         try:
             got["size"] = thread_stack_bounds()[1]
-        except OSError as exc:
+        except BaseException as exc:            # noqa: BLE001
             got["err"] = f"{type(exc).__name__}: {exc}"
         finally:
             stop.wait(20)
@@ -301,9 +319,12 @@ def run_stack():
     try:
         saved = resource.getrlimit(resource.RLIMIT_STACK)
         default = stack_mapping_size()
-        resource.setrlimit(resource.RLIMIT_STACK, (1024 * 1024, resource.RLIM_INFINITY))
+        set_soft(resource.RLIMIT_STACK, 1024 * 1024)
         lowered = stack_mapping_size()
-        resource.setrlimit(resource.RLIMIT_STACK, saved)
+        try:
+            resource.setrlimit(resource.RLIMIT_STACK, saved)
+        except (ValueError, OSError):
+            set_soft(resource.RLIMIT_STACK, saved[0])
         restored = stack_mapping_size()
         explicit = stack_mapping_size(128 * 1024)
     except OSError as exc:
@@ -332,21 +353,27 @@ def run_stack():
 
 # ---------------------------------------------------------------- cell 5: soft/hard
 def run_softhard():
+    # A root process may raise hard limits (OpenBSD VM, and any root shell), so
+    # the privilege check needs an unprivileged process to mean anything.
+    if os.geteuid() == 0:
+        emit("softhard", "privileged process: hard limits are raisable",
+             f"euid={os.geteuid()}", "SKIP", gate=False)
+        return
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (soft, soft))
-    try:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
-        verdict = "REFUTED: hard was raisable?!" if hard > soft else "PASS"
-    except (ValueError, OSError):
-        verdict = "PASS"
-    emit("softhard-raise-hard", "raising the hard limit needs privilege", "-", verdict)
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard + 1, hard + 1))
-        emit("softhard-raise-beyond", "soft above the hard limit is refused",
-             "accepted", "FAIL")
+        emit("softhard-raise-hard", "raising the hard limit needs privilege",
+             f"accepted above {hard}", "FAIL")
     except (ValueError, OSError) as e:
-        emit("softhard-raise-beyond", "soft above the hard limit is refused",
+        emit("softhard-raise-hard", "raising the hard limit needs privilege",
              type(e).__name__, "PASS")
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard) if soft <= hard else (hard, hard))
+        emit("softhard-soft", "soft may be set within the hard limit",
+             f"soft={soft} hard={hard}", "PASS")
+    except (ValueError, OSError) as e:
+        emit("softhard-soft", "soft may be set within the hard limit",
+             f"{type(e).__name__}: {e}", "FAIL")
 
 
 def main():
