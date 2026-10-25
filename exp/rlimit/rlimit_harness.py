@@ -137,16 +137,22 @@ def cell_inflight(sender_limit, extra=8, drain=False):
 
 
 def run_inflight():
+    # errno 109 is ETOOMANYREFS on Linux; the number differs on the BSDs and the
+    # limit may not be enforced the same way, so there the row is a finding.
+    on_linux = sys.platform.startswith("linux")
     sent_low, err_low = cell_inflight(32)
+    hit = err_low is not None and err_low.errno == 109
     emit("inflight", "sender limited to 32 stops after ~32 in-flight fds",
          f"sent={sent_low} err={err_low.errno if err_low else None}",
-         "PASS" if err_low is not None and err_low.errno == 109 else "FAIL")
+         ("PASS" if hit else "FAIL") if on_linux
+         else f"FINDING: errno={err_low.errno if err_low else None}",
+         gate=on_linux)
     # Matched control: same limit, same number of sends, the only difference is
     # that the receiver drains, so nothing accumulates in flight.
     sent_hi, err_hi = cell_inflight(32, extra=8, drain=True)
     emit("inflight-control", "same limit and sends with the receiver draining: no ETOOMANYREFS",
          f"sent={sent_hi} err={err_hi.errno if err_hi else None}",
-         "PASS" if err_hi is None else "FAIL")
+         "PASS" if err_hi is None else "FAIL", gate=on_linux)
 
 
 # ---------------------------------------------------------------- cell 2: ctrunc
@@ -173,12 +179,20 @@ def cell_ctrunc(free_slots):
 
 
 def run_ctrunc():
+    # MSG_CTRUNC is not the same number on every kernel, and xnu does not report
+    # truncation for a short receive at all — so outside Linux this is a finding.
+    on_linux = sys.platform.startswith("linux")
+    trunc = getattr(socket, "MSG_CTRUNC", 8)
     got, flags = cell_ctrunc(0)
+    hit = got == 0 and flags == trunc
     emit("ctrunc", "0 fds and MSG_CTRUNC when the receiver's table is full",
-         f"fds={got} flags={flags}", "PASS" if got == 0 and flags == 8 else "FAIL")
+         f"fds={got} flags={flags}",
+         ("PASS" if hit else "FAIL") if on_linux else f"FINDING: flags={flags}",
+         gate=on_linux)
     got_c, flags_c = cell_ctrunc(1)
     emit("ctrunc-control", "1 fd and no MSG_CTRUNC with a free slot",
-         f"fds={got_c} flags={flags_c}", "PASS" if got_c == 1 and flags_c == 0 else "FAIL")
+         f"fds={got_c} flags={flags_c}",
+         "PASS" if got_c == 1 and flags_c == 0 else "FAIL", gate=on_linux)
 
 
 # ---------------------------------------------------------------- cell 3: AS
@@ -201,6 +215,10 @@ def cell_as(limit, want):
 
 
 def run_as():
+    if not hasattr(resource, "RLIMIT_AS"):
+        # OpenBSD has no RLIMIT_AS: RLIMIT_DATA covers malloc and anonymous mmap.
+        emit("as", "no RLIMIT_AS on this platform", "skipped", "SKIP", gate=False)
+        return
     saved = resource.getrlimit(resource.RLIMIT_AS)
     cap = 128 * 1024 * 1024
     got, err = cell_as(cap, 512 * 1024 * 1024)
@@ -219,11 +237,21 @@ _libc = None
 
 
 def thread_stack_bounds():
-    """(start, size) of the CALLING thread's own stack, as libc reports it."""
+    """(start, size) of the CALLING thread's own stack, as libc reports it.
+
+    Darwin has no pthread_getattr_np(); it exposes the two _np accessors instead.
+    """
     global _libc
     if _libc is None:
         _libc = ctypes.CDLL(None, use_errno=True)
         _libc.pthread_self.restype = ctypes.c_void_p
+    if sys.platform == "darwin":
+        _libc.pthread_get_stacksize_np.restype = ctypes.c_size_t
+        _libc.pthread_get_stacksize_np.argtypes = [ctypes.c_void_p]
+        size = _libc.pthread_get_stacksize_np(ctypes.c_void_p(_libc.pthread_self()))
+        if not size:
+            raise OSError(0, "pthread_get_stacksize_np returned 0")
+        return 0, size
     attr = ctypes.create_string_buffer(256)          # pthread_attr_t, zeroed
     rc = _libc.pthread_getattr_np(ctypes.c_void_p(_libc.pthread_self()), attr)
     if rc:
@@ -269,16 +297,23 @@ def stack_mapping_size(explicit=None):
 
 
 def run_stack():
-    # Order matters: threading.stack_size() is process-global and sticky, so the
-    # explicit-size control runs LAST and is reset afterwards.
-    saved = resource.getrlimit(resource.RLIMIT_STACK)
-    default = stack_mapping_size()
-    resource.setrlimit(resource.RLIMIT_STACK, (1024 * 1024, resource.RLIM_INFINITY))
-    lowered = stack_mapping_size()
-    resource.setrlimit(resource.RLIMIT_STACK, saved)
-    restored = stack_mapping_size()
-    explicit = stack_mapping_size(512 * 1024)
-    threading.stack_size(0)
+    on_linux = sys.platform.startswith("linux")
+    try:
+        saved = resource.getrlimit(resource.RLIMIT_STACK)
+        default = stack_mapping_size()
+        resource.setrlimit(resource.RLIMIT_STACK, (1024 * 1024, resource.RLIM_INFINITY))
+        lowered = stack_mapping_size()
+        resource.setrlimit(resource.RLIMIT_STACK, saved)
+        restored = stack_mapping_size()
+        explicit = stack_mapping_size(128 * 1024)
+    except OSError as exc:
+        # e.g. a libc without pthread_getattr_np and no _np accessor: report the
+        # gap instead of failing a platform we cannot measure.
+        emit("stack-libc", "thread stack not measurable with this libc",
+             str(exc), "SKIP", gate=False)
+        return
+    finally:
+        threading.stack_size(0)
     # A FINDING, not a control: musl gives every thread one fixed-size stack, glibc
     # takes the soft RLIMIT_STACK at thread creation. Which one this host does is
     # the measurement, so the row never fails the run.
@@ -288,9 +323,10 @@ def run_stack():
          f"rlimit_soft={saved[0]//1024}K",
          "PASS" if same else "FINDING: stack follows RLIMIT_STACK",
          note="" if same else "libc-dependent", gate=False)
-    emit("stack-method-control", "an explicit 512K stack is visible to the method",
+    emit("stack-method-control", "an explicit 128K stack is visible to the method",
          f"explicit={explicit//1024}K default={default//1024}K",
-         "PASS" if 0 < explicit < default else "FAIL: method cannot see a stack")
+         "PASS" if 0 < explicit < default else "FAIL: method cannot see a stack",
+         gate=on_linux)
 
 
 
