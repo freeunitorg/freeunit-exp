@@ -1,0 +1,45 @@
+name: exp-rlimit-harness
+
+# Experiment, not a gate: runs the RLIMIT harness on both libc families so the
+# glibc/musl difference (thread stacks vs RLIMIT_STACK) is measured, not assumed.
+# See docs/exp/rlimit-app-limits.md.
+
+on:
+  push:
+    paths:
+      - 'exp/rlimit/**'
+      - 'docs/exp/rlimit-app-limits.md'
+      - '.github/workflows/exp-rlimit-harness.yml'
+  pull_request:
+    paths:
+      - 'exp/rlimit/**'
+      - 'docs/exp/rlimit-app-limits.md'
+      - '.github/workflows/exp-rlimit-harness.yml'
+  workflow_dispatch:
+
+jobs:
+  musl:
+    name: musl (alpine:edge)
+    runs-on: ubuntu-26.04
+    container: alpine:edge
+    steps:
+      - run: apk add --no-cache python3
+      - uses: actions/checkout@v4
+      - name: libc
+        run: python3 -c "import platform,sys;print(platform.libc_ver(), sys.version)"
+      - name: limits in force
+        run: cat /proc/self/limits
+      - name: harness
+        run: python3 exp/rlimit/rlimit_harness.py --self-test
+
+  glibc:
+    name: glibc (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: libc
+        run: python3 -c "import platform,sys;print(platform.libc_ver(), sys.version)"
+      - name: limits in force
+        run: cat /proc/self/limits
+      - name: harness
+        run: python3 exp/rlimit/rlimit_harness.py --self-test
