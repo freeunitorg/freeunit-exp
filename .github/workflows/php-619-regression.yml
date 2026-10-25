@@ -1,0 +1,72 @@
+name: php-619-regression
+
+# Regression gate for the session.upload_progress cross-request UAF
+# (CVE-2026-109619 / CVE-2026-109618), fixed in php-src 3c832b5 and released in
+# PHP 8.5.12 / 8.4.27.
+#
+# Builds two ASAN builds and runs docs/exp/php-session-upload-progress-109619.phpt:
+#   php-8.4.26  -> the test MUST FAIL  (proves it can catch the bug)
+#   php-8.4.27  -> the test MUST PASS  (proves the shipped fix suffices)
+# No network target beyond 127.0.0.1; validation harness, not a weapon.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ hermes/php-session-upload ]
+    paths:
+      - 'docs/exp/php-session-upload-progress-109619.phpt'
+      - '.github/workflows/php-619-regression.yml'
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: php-8.4.26
+            expect: FAIL
+          - tag: php-8.4.27
+            expect: PASS
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential autoconf bison re2c pkg-config
+
+      - name: Build ${{ matrix.tag }} with ASAN
+        run: |
+          set -e
+          git clone --depth 1 --branch "${{ matrix.tag }}" https://github.com/php/php-src.git php-src
+          cd php-src
+          ./buildconf --force
+          ./configure --enable-debug --disable-all --enable-cli --enable-session \
+            CFLAGS="-O1 -g -fsanitize=address -fno-omit-frame-pointer" \
+            LDFLAGS="-fsanitize=address"
+          make -j"$(nproc)"
+          sapi/cli/php -v | head -1
+
+      - name: Run the regression test
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:halt_on_error=1:exitcode=42
+        run: |
+          set +e
+          cp docs/exp/php-session-upload-progress-109619.phpt \
+             php-src/ext/session/tests/gh_109619_cross_request.phpt
+          cd php-src
+          sapi/cli/php run-tests.php -q -p "$PWD/sapi/cli/php" \
+            ext/session/tests/gh_109619_cross_request.phpt > "run.log" 2>&1
+          rc=$?
+          tail -60 run.log
+          echo "::group::artifacts"
+          cat ext/session/tests/gh_109619_cross_request.diff 2>/dev/null
+          echo "::endgroup::"
+          if [ "$rc" -eq 0 ]; then verdict=PASS; else verdict=FAIL; fi
+          echo "php ${{ matrix.tag }}: run-tests rc=$rc -> $verdict (expected ${{ matrix.expect }})"
+          if [ "$verdict" != "${{ matrix.expect }}" ]; then
+            echo "::error::php ${{ matrix.tag }}: got $verdict, expected ${{ matrix.expect }}"
+            exit 1
+          fi
