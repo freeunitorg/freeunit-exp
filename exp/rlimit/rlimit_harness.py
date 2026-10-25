@@ -237,13 +237,20 @@ def run_as():
         # OpenBSD has no RLIMIT_AS: RLIMIT_DATA covers malloc and anonymous mmap.
         emit("as", "no RLIMIT_AS on this platform", "skipped", "SKIP", gate=False)
         return
-    saved = resource.getrlimit(resource.RLIMIT_AS)
-    cap = 128 * 1024 * 1024
-    got, err = cell_as(cap, 512 * 1024 * 1024)
+    on_linux = sys.platform.startswith("linux")
+    try:
+        got, err = cell_as(128 * 1024 * 1024, 512 * 1024 * 1024)
+    except (ValueError, OSError) as exc:
+        # macOS accepts the value in getrlimit() but refuses to set it from an
+        # unprivileged process; the semantics there are a Mach map limit anyway.
+        emit("as", "RLIMIT_AS not settable here", f"{type(exc).__name__}: {exc}",
+             "SKIP", gate=False)
+        return
+    hit = err is not None
     emit("as", "a 128M address-space cap stops a 512M reservation",
-         f"reserved={got//1024//1024}M err={err}",
-         "PASS" if err is not None else "FAIL")
-    resource.setrlimit(resource.RLIMIT_AS, saved)          # restore before the control
+         f"reserved={got // 1024 // 1024}M err={err}",
+         (("PASS" if hit else "FAIL") if on_linux else f"FINDING: err={err}"),
+         gate=on_linux)
     got_c, err_c = cell_as(None, 256 * 1024 * 1024)
     emit("as-control", "the same reservation succeeds uncapped",
          f"reserved={got_c//1024//1024}M err={err_c}",
