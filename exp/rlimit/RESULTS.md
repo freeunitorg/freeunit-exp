@@ -40,13 +40,37 @@ What each row establishes:
 | `stack-method-control` | An explicit 512 KiB stack is measured as 516 KiB, so the mapping-diff method really does see a thread stack. |
 | `softhard-*` | The hard limit cannot be raised by this process; a soft value above the hard limit is refused. |
 
-Not measurable here, and deliberately not filled in:
+Not measurable on this host, and deliberately not filled in from another host's
+numbers:
 
-- **glibc** — this host has no glibc. The thread-stack-per-`RLIMIT_STACK` cell and
-  the PHP-under-`AS` cell need `ubuntu-latest` / a built PHP runtime.
-- **FreeBSD** — no host, no CI job.
+- **FreeBSD, OpenBSD** — no host, no CI job. Their statements in
+  `rlimit-app-limits.md` are source-read.
+- **macOS** — the build job exists, the harness is not wired into it.
 - **Live `unitd`** — the `NOFILE` → `MSG_CTRUNC` → port-teardown path is proven
   here only at the syscall level.
+
+## CI, both libc families
+
+`.github/workflows/exp-rlimit-harness.yml` runs the same file on `alpine:edge`
+and `ubuntu-latest`. Run 40200671611, head `5670373b`, both legs green:
+
+| cell | musl 1.2.6 (Alpine edge) | glibc 2.43 (ubuntu-latest) |
+|---|---|---|
+| `inflight` | PASS, errno 109 | PASS, errno 109 |
+| `ctrunc` | PASS, 0 fds, `flags=8` | PASS, 0 fds, `flags=8` |
+| `as` | PASS, stopped at 104M | PASS, stopped at 96M |
+| `stack-libc` | 2050K at every setting, `RLIMIT_STACK` soft = 16M | **16384K at every setting, `RLIMIT_STACK` soft = 16M** |
+| `stack-method-control` | PASS, explicit 514K visible | PASS, explicit 512K visible |
+
+The stack row is the cross-libc result: musl gives 2050K whatever the limit is,
+glibc gives exactly the soft limit that was in force when the interpreter
+started, and lowering the limit afterwards moves neither. That is the documented
+"at the time the program started" behaviour, measured rather than quoted — and it
+is why the row is a finding, not a gate.
+
+The first CI run of this job failed on glibc: the mapping-diff method reported
+16904K for a 512K request, i.e. it measured something that was not the stack.
+That failure is why `thread_stack_bounds()` now asks the C library.
 
 Four defects this harness had before it was trusted, each caught by a control:
 rows lost in forked children (first version printed nothing and exited 0); hard
