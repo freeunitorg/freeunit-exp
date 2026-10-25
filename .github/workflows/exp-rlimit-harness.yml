@@ -1,0 +1,86 @@
+name: exp-rlimit-harness
+
+# Experiment, not a gate: runs the RLIMIT harness on both libc families so the
+# glibc/musl difference (thread stacks vs RLIMIT_STACK) is measured, not assumed.
+# See docs/exp/rlimit-app-limits.md.
+
+on:
+  push:
+    paths:
+      - 'exp/rlimit/**'
+      - 'docs/exp/rlimit-app-limits.md'
+      - '.github/workflows/exp-rlimit-harness.yml'
+  pull_request:
+    paths:
+      - 'exp/rlimit/**'
+      - 'docs/exp/rlimit-app-limits.md'
+      - '.github/workflows/exp-rlimit-harness.yml'
+  workflow_dispatch:
+
+jobs:
+  musl:
+    name: musl (alpine:edge)
+    runs-on: ubuntu-26.04
+    container: alpine:edge
+    steps:
+      - run: apk add --no-cache python3
+      - uses: actions/checkout@v4
+      - name: libc
+        run: python3 -c "import platform,sys;print(platform.libc_ver(), sys.version)"
+      - name: limits in force
+        run: cat /proc/self/limits
+      - name: harness
+        run: python3 exp/rlimit/rlimit_harness.py --self-test
+
+  glibc:
+    name: glibc (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: libc
+        run: python3 -c "import platform,sys;print(platform.libc_ver(), sys.version)"
+      - name: limits in force
+        run: cat /proc/self/limits
+      - name: harness
+        run: python3 exp/rlimit/rlimit_harness.py --self-test
+
+  macos:
+    name: macOS ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS 26 is the newest image; 15 is kept to see whether the answer moves
+        # with the OS release rather than with the libc alone.
+        os: [macos-26, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: libc and release
+        run: |
+          python3 -c "import platform,sys;print(platform.libc_ver(), platform.mac_ver()[0], sys.version)"
+          sysctl kern.maxfilesperproc kern.maxprocperuid || true
+      - name: limits in force
+        run: launchctl limit || true
+      - name: harness
+        run: python3 exp/rlimit/rlimit_harness.py --self-test
+
+  openbsd:
+    name: OpenBSD ${{ matrix.release }}
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['7.9']
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: harness in an OpenBSD VM
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          prepare: pkg_add python3
+          run: |
+            python3 -c "import platform,sys;print(sys.platform, platform.machine(), sys.version)"
+            ulimit -a || true
+            sysctl kern.maxthread kern.maxfiles 2>/dev/null || true
+            python3 exp/rlimit/rlimit_harness.py --self-test
