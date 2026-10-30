@@ -75,8 +75,10 @@ Follow in order:
 
 ## Security
 
-- Do **not** open public issues for vulnerabilities. Report privately to
-  **team@freeunit.org** (or t.me/freeunit_support).
+- Do **not** open public issues, and do not post vulnerability details in the
+  chat, for vulnerabilities. Report privately by email to **team@freeunit.org**.
+  The [chat](https://t.me/freeunit_support) (FreeUnit Support) is for general
+  questions, not embargoed details.
 - Include: description, steps to reproduce, affected versions, impact. Severity
   uses CVSS v3.1.
 - Coordinated disclosure: 48 h acknowledgement, 7 d assessment, fix within 30 d.
