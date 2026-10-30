@@ -1,0 +1,81 @@
+# FreeUnit
+
+> FreeUnit is the community LTS fork of the Unit application server: a polyglot
+> app server (PHP, Python, Node.js, Ruby, Perl, Java, Go, WebAssembly) written in
+> C as a multi-process runtime. Apache-2.0. This file tells people and coding
+> agents where to build, test, review and report.
+
+## Repositories
+
+- [freeunit](https://github.com/freeunitorg/freeunit): the server (C). Source of
+  truth, branch `master`. Agents treat it as **read-only**; merges and tags are
+  human-only.
+- [freeunit-harness](https://github.com/freeunitorg/freeunit-harness): contributor
+  toolkit for people and agents — build, a running `unitd`, CI gates, A/B
+  benchmarks, procedures. Start here.
+- [freeunit-exp](https://github.com/freeunitorg/freeunit-exp): the Hermes bot's
+  experimental fork — research, review, benchmark work on top of `freeunit` master.
+  **Nothing here is a release.**
+- [docs](https://github.com/freeunitorg/docs): documentation sources
+  (reStructuredText, Sphinx).
+
+## Install
+
+- Build from source: `./configure --openssl --otel && make`
+- Docker images: `freeunitorg/freeunit:<version>-<variant>` on Docker Hub
+  (`php-8.4`, `node-24`, `minimal`, ...).
+- Debian/Ubuntu `.deb` and `SHA256SUMS` are published as GitHub Release assets on
+  each version tag.
+- Check the current version and its supported PHP before deploying.
+
+## Build and test
+
+- Python suite: `sudo pytest-3 --print-log test/` — **stop any `unitd` on :8080
+  first** (it breaks pytest at startup).
+- C core / libunit: `./configure --tests --openssl && make && make build/lib/libunit.a && make tests && ./build/tests`
+- Test-hook gate: `.github/scripts/check-test-hooks.sh` must exit 0.
+- Build with `./configure --hardening=strict` before submitting.
+- Style gate: ast-grep config under `tools/ast-grep/`, over `src/`.
+- Easier path — the harness: `make doctor`, `make dev`, `make stop`, `make test`,
+  `make ci-local` (`make help` lists every target). Start an agent in the harness
+  root, **not** in `./src`.
+
+## Contributing
+
+- Read [CONTRIBUTING.md](https://github.com/freeunitorg/freeunit/blob/master/CONTRIBUTING.md)
+  and the PR template.
+- A change under `src/` needs a test under `test/` or `src/test/`; if none is
+  warranted, add the `no-test-needed` label or a commit trailer with the reason.
+- AI-assisted work carries a trailer: `Reviewed-by: FreeUnitOPS (<model>, <harness>)`
+  — model and harness are for statistics and provenance.
+- Keep the PR factual: state what was verified and what was not.
+
+## Security
+
+- Do **not** open public issues for vulnerabilities. Report privately to
+  **team@freeunit.org** (or t.me/freeunit_support).
+- Include: description, steps to reproduce, affected versions, impact. Severity
+  uses CVSS v3.1.
+- Coordinated disclosure: 48 h acknowledgement, 7 d assessment, fix within 30 d.
+- Supported: 1.37.x (active), 1.34.x (LTS). 1.35.x / 1.36.x are EOL — upgrade.
+- **Never** test an exploit against a live or production system you do not own or
+  have written permission to test. Provide a PoC inside the report, not against
+  someone's server.
+
+## For coding agents
+
+- Agent entry point: [freeunit-harness AGENTS.md](https://github.com/freeunitorg/freeunit-harness/blob/main/AGENTS.md)
+  (also reachable as `CLAUDE.md`). Procedures live in `skills/` (names start
+  `freeunit-`).
+- Write and open PRs in **freeunit-exp**; treat **freeunit** as read-only. Merges,
+  tags and releases are made by a human.
+- Never print secrets (tokens, keys, credentials); replace them with `[REDACTED]`.
+- Cite the code you reasoned about (file and line); say when a claim is unverified.
+
+## Links
+
+- [freeunit.org](https://freeunit.org/): project site
+- [ai-assistant.json](https://freeunit.org/ai-assistant.json): machine-readable site metadata
+- [AGENTS.md](https://github.com/freeunitorg/freeunit-harness/blob/main/AGENTS.md)
+- [SECURITY.md](https://github.com/freeunitorg/freeunit/blob/master/SECURITY.md)
+- [Docs](https://github.com/freeunitorg/docs)
