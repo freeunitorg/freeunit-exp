@@ -1,0 +1,104 @@
+name: PHP next (pre-release)
+
+# Build the tree against a PHP pre-release, then smoke-test the module.
+# Manual only: it downloads a pre-release tarball from php.net and compiles
+# PHP from source, so it is a check, not a gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      php_tarball:
+        description: 'Tarball name, without the extension'
+        required: true
+        default: 'php-8.6.0RC4'
+      php_base_url:
+        description: 'Directory that holds the tarball'
+        required: true
+        default: 'https://downloads.php.net/~mbeccati'
+
+permissions:
+  contents: read
+
+jobs:
+  php-next:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf bison re2c pkg-config \
+            libssl-dev libpcre2-dev zlib1g-dev
+
+      - name: Build PHP ${{ inputs.php_tarball }}
+        env:
+          TARBALL: ${{ inputs.php_tarball }}
+          BASE: ${{ inputs.php_base_url }}
+        run: |
+          set -eux
+          P="$RUNNER_TEMP/php"
+          mkdir -p "$P/src"
+          cd "$P/src"
+          curl -fsSLO "$BASE/$TARBALL.tar.xz"
+          tar xf "$TARBALL.tar.xz"
+          cd "$TARBALL"
+          ./configure --prefix="$P/inst" \
+            --disable-all --enable-cli --enable-embed=shared \
+            --disable-libxml --disable-dom \
+            --without-sqlite3 --without-pdo-sqlite
+          make -j"$(nproc)"
+          make install
+          "$P/inst/bin/php" -v
+
+      - name: Build unitd and the PHP module
+        run: |
+          set -eux
+          P="$RUNNER_TEMP/php"
+          ./configure --openssl \
+            --prefix="$RUNNER_TEMP/unit" \
+            --statedir="$RUNNER_TEMP/state"
+          ./configure php --config="$P/inst/bin/php-config" --lib-path="$P/inst/lib"
+          make -j"$(nproc)"
+          make -j"$(nproc)" php
+          make install
+          ls -l "$RUNNER_TEMP/unit/lib/unit/modules/"
+
+      - name: Smoke test
+        run: |
+          set -eux
+          P="$RUNNER_TEMP/php"
+          U="$RUNNER_TEMP/unit"
+          export LD_LIBRARY_PATH="$P/inst/lib"
+
+          mkdir -p "$RUNNER_TEMP/www" "$RUNNER_TEMP/state"
+          printf '<?php echo "ok:", PHP_VERSION, "\\n";\n' > "$RUNNER_TEMP/www/index.php"
+
+          "$U/sbin/unitd" --no-daemon \
+            --control "unix:$RUNNER_TEMP/control.sock" \
+            --statedir "$RUNNER_TEMP/state" \
+            --pid "$RUNNER_TEMP/unit.pid" \
+            --log "$RUNNER_TEMP/unit.log" \
+            --tmpdir "$RUNNER_TEMP" &
+
+          for _ in $(seq 60); do
+            [ -S "$RUNNER_TEMP/control.sock" ] && break
+            sleep 1
+          done
+
+          curl -sS --unix-socket "$RUNNER_TEMP/control.sock" -X PUT \
+            --data-binary @- http://localhost/config <<JSON
+          {"listeners":{"127.0.0.1:8080":{"pass":"applications/app"}},
+           "applications":{"app":{"type":"php","root":"$RUNNER_TEMP/www","script":"index.php"}}}
+          JSON
+          echo
+
+          curl -sS -D- http://127.0.0.1:8080/
+          curl -sS http://127.0.0.1:8080/ | grep -q '^ok:'
+
+      - name: Unit log
+        if: always()
+        run: tail -60 "$RUNNER_TEMP/unit.log" || true
