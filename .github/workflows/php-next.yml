@@ -1,26 +1,42 @@
-name: PHP next (pre-release)
+name: PHP 8.6 RC and php-src next
 
-# Build the tree against a PHP pre-release, then smoke-test the module and
-# the three compressors (zlib, brotli, zstd).  Manual only: it downloads a
-# pre-release tarball from php.net and compiles PHP from source.
+# Two PHP lines in one manual check, kept apart on purpose:
+#   - prerelease: a PHP release candidate tarball (8.6.0RC4), the thing that
+#     will ship as 8.6.0;
+#   - next: php-src git, i.e. what comes after 8.6.
+# A finding on `next` is not a finding on the RC and the other way round, so
+# the source and the ref are printed in the log and in the job name.
+#
+# Both lines build the tree, the PHP module and the three compressors, then
+# prove gzip, br and zstd on the wire.
 
 on:
   workflow_dispatch:
     inputs:
+      php_source:
+        description: 'prerelease = tarball, next = php-src git'
+        type: choice
+        options: ['prerelease', 'next']
+        default: 'prerelease'
       php_tarball:
-        description: 'Tarball name, without the extension'
-        required: true
+        description: 'prerelease only: tarball name, without the extension'
+        required: false
         default: 'php-8.6.0RC4'
       php_base_url:
-        description: 'Directory that holds the tarball'
-        required: true
+        description: 'prerelease only: directory that holds the tarball'
+        required: false
         default: 'https://downloads.php.net/~mbeccati'
+      php_ref:
+        description: 'next only: php-src ref'
+        required: false
+        default: 'master'
 
 permissions:
   contents: read
 
 jobs:
-  php-next:
+  php-build:
+    name: php-${{ inputs.php_source }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
@@ -31,21 +47,41 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential autoconf bison re2c pkg-config \
+            build-essential autoconf bison re2c pkg-config git \
             libssl-dev libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev
 
-      - name: Build PHP ${{ inputs.php_tarball }}
+      - name: Fetch PHP (prerelease tarball)
+        if: inputs.php_source == 'prerelease'
         env:
           TARBALL: ${{ inputs.php_tarball }}
           BASE: ${{ inputs.php_base_url }}
         run: |
           set -eux
-          P="$RUNNER_TEMP/php"
-          mkdir -p "$P/src"
-          cd "$P/src"
+          mkdir -p "$RUNNER_TEMP/php-src-src"
+          cd "$RUNNER_TEMP/php-src-src"
           curl -fsSLO "$BASE/$TARBALL.tar.xz"
           tar xf "$TARBALL.tar.xz"
-          cd "$TARBALL"
+          mv "$TARBALL" "$RUNNER_TEMP/php-src"
+          echo "PHP_SOURCE=prerelease $TARBALL $BASE"
+
+      - name: Fetch PHP (php-src git)
+        if: inputs.php_source == 'next'
+        env:
+          REF: ${{ inputs.php_ref }}
+        run: |
+          set -eux
+          git clone --depth 1 --branch "$REF" \
+            https://github.com/php/php-src.git "$RUNNER_TEMP/php-src"
+          cd "$RUNNER_TEMP/php-src"
+          ./buildconf --force
+          echo "PHP_SOURCE=next $REF $(git rev-parse HEAD)"
+
+      - name: Build PHP
+        run: |
+          set -eux
+          P="$RUNNER_TEMP/php"
+          cd "$RUNNER_TEMP/php-src"
+          grep -m1 'define PHP_VERSION ' main/php_version.h || true
           ./configure --prefix="$P/inst" \
             --disable-all --enable-cli --enable-embed=shared \
             --with-zlib \
