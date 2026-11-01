@@ -1,8 +1,8 @@
 name: PHP next (pre-release)
 
-# Build the tree against a PHP pre-release, then smoke-test the module.
-# Manual only: it downloads a pre-release tarball from php.net and compiles
-# PHP from source, so it is a check, not a gate.
+# Build the tree against a PHP pre-release, then smoke-test the module and
+# the three compressors (zlib, brotli, zstd).  Manual only: it downloads a
+# pre-release tarball from php.net and compiles PHP from source.
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential autoconf bison re2c pkg-config \
-            libssl-dev libpcre2-dev zlib1g-dev
+            libssl-dev libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev
 
       - name: Build PHP ${{ inputs.php_tarball }}
         env:
@@ -48,17 +48,20 @@ jobs:
           cd "$TARBALL"
           ./configure --prefix="$P/inst" \
             --disable-all --enable-cli --enable-embed=shared \
+            --with-zlib \
             --disable-libxml --disable-dom \
             --without-sqlite3 --without-pdo-sqlite
           make -j"$(nproc)"
           make install
           "$P/inst/bin/php" -v
+          "$P/inst/bin/php" -r 'var_dump(function_exists("gzencode"));'
 
       - name: Build unitd and the PHP module
         run: |
           set -eux
           P="$RUNNER_TEMP/php"
           ./configure --openssl \
+            --zlib --zstd --brotli \
             --prefix="$RUNNER_TEMP/unit" \
             --statedir="$RUNNER_TEMP/state"
           ./configure php --config="$P/inst/bin/php-config" --lib-path="$P/inst/lib"
@@ -75,7 +78,14 @@ jobs:
           export LD_LIBRARY_PATH="$P/inst/lib"
 
           mkdir -p "$RUNNER_TEMP/www" "$RUNNER_TEMP/state"
-          printf '<?php echo "ok:", PHP_VERSION, "\\n";\n' > "$RUNNER_TEMP/www/index.php"
+          cat > "$RUNNER_TEMP/www/index.php" <<'PHP'
+          <?php
+          header('Content-Type: text/html');
+          echo 'ok:', PHP_VERSION, "\n";
+          for ($i = 0; $i < 400; $i++) {
+              echo 'compression-probe-0123456789abcdef';
+          }
+          PHP
 
           "$U/sbin/unitd" --no-daemon \
             --control "unix:$RUNNER_TEMP/control.sock" \
@@ -89,15 +99,29 @@ jobs:
             sleep 1
           done
 
+          "$U/sbin/unitd" --version
+
           curl -sS --unix-socket "$RUNNER_TEMP/control.sock" -X PUT \
             --data-binary @- http://localhost/config <<JSON
           {"listeners":{"127.0.0.1:8080":{"pass":"applications/app"}},
+           "settings":{"http":{"compression":{"types":["text/html*"],
+             "compressors":[{"encoding":"gzip","level":1},
+                            {"encoding":"br","level":1},
+                            {"encoding":"zstd","level":1}]}}},
            "applications":{"app":{"type":"php","root":"$RUNNER_TEMP/www","script":"index.php"}}}
           JSON
           echo
 
-          curl -sS -D- http://127.0.0.1:8080/
-          curl -sS http://127.0.0.1:8080/ | grep -q '^ok:'
+          curl -sS http://127.0.0.1:8080/ | head -c 200
+          echo
+
+          for enc in gzip br zstd; do
+            curl -sS -H "Accept-Encoding: $enc" -D "$RUNNER_TEMP/h.$enc" \
+              -o "$RUNNER_TEMP/b.$enc" http://127.0.0.1:8080/
+            grep -qi "^content-encoding: $enc" "$RUNNER_TEMP/h.$enc" \
+              || { echo "missing Content-Encoding: $enc"; exit 1; }
+            printf '%-5s %s bytes\n' "$enc" "$(wc -c < "$RUNNER_TEMP/b.$enc")"
+          done
 
       - name: Unit log
         if: always()
