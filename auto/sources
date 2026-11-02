@@ -122,7 +122,7 @@ NXT_LIB_UNIT_TEST_STATIC="libunit-tests.a"
 
 NXT_LIB_TLS_DEPS="src/nxt_tls.h"
 NXT_LIB_TLS_SRCS="src/nxt_cert.c"
-NXT_LIB_OPENSSL_SRCS="src/nxt_openssl.c"
+NXT_LIB_OPENSSL_SRCS="src/nxt_openssl.c src/nxt_openssl_ktls.c"
 
 NXT_LIB_PCRE_SRCS="src/nxt_pcre.c"
 NXT_LIB_PCRE2_SRCS="src/nxt_pcre2.c"
@@ -166,6 +166,8 @@ NXT_TEST_SRCS=" \
     src/test/nxt_rbtree_test.c \
     src/test/nxt_term_parse_test.c \
     src/test/nxt_msec_diff_test.c \
+    src/test/nxt_ktls_test.c \
+    src/test/nxt_ktls_keys_test.c \
     src/test/nxt_mp_test.c \
     src/test/nxt_lvlhsh_test.c \
     src/test/nxt_gmtime_test.c \
@@ -320,6 +322,11 @@ NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_SELECT_SRCS"
 if [ "$NXT_HAVE_LINUX_SENDFILE" = "YES" \
      -o "$NXT_TEST_BUILD_LINUX_SENDFILE" = "YES" ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_LINUX_SENDFILE_SRCS"
+fi
+
+
+if [ "$NXT_HAVE_KTLS" = "YES" ]; then
+    NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_ktls.c"
 fi
 
 
