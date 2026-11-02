@@ -87,6 +87,7 @@ struct nxt_tls_init_s {
     nxt_time_t                    timeout;
     nxt_conf_value_t              *conf_cmds;
     nxt_conf_value_t              *tickets_conf;
+    nxt_bool_t                    ktls;
 
     nxt_tls_conf_t                *conf;
 };

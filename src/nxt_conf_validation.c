@@ -670,6 +670,9 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_tls_members[] = {
         .type       = NXT_CONF_VLDT_OBJECT,
         .validator  = nxt_conf_vldt_object,
         .u.members  = nxt_conf_vldt_session_members,
+    }, {
+        .name       = nxt_string("ktls"),
+        .type       = NXT_CONF_VLDT_BOOLEAN,
     },
 
     NXT_CONF_VLDT_END
