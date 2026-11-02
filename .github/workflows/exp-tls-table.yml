@@ -1,0 +1,102 @@
+name: exp-tls-table
+
+# Gate for the TLS backend-table change (increment A1): the connection entry
+# point moves onto nxt_tls_lib_t.  Two things must hold, and neither is visible
+# from a static read:
+#
+#   1. With OpenSSL, TLS still behaves the same.  test_tls.py drives real
+#      handshakes through unitd, so it exercises conn_init through the table.
+#   2. Without OpenSSL, the server still builds.  conn_init now lives on the
+#      table; if that table is only reachable under --openssl, the no-TLS build
+#      breaks in a way the TLS build can never show.
+#
+# Path-filtered to the files the change touches, so it does not queue behind the
+# server's own jobs.
+
+on:
+  push:
+    paths:
+      - 'src/nxt_tls.h'
+      - 'src/nxt_openssl.c'
+      - 'src/nxt_router.c'
+      - 'src/nxt_h1proto.c'
+      - '.github/workflows/exp-tls-table.yml'
+  pull_request:
+    paths:
+      - 'src/nxt_tls.h'
+      - 'src/nxt_openssl.c'
+      - 'src/nxt_router.c'
+      - 'src/nxt_h1proto.c'
+      - '.github/workflows/exp-tls-table.yml'
+
+jobs:
+  # The behaviour gate: build with OpenSSL and run the TLS test file.
+  tls:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get -y -qq install libssl-dev libpcre2-dev zlib1g-dev \
+                                    python3-dev python3-pytest
+
+      - name: Configure unit
+        run: ./configure --openssl --tests
+
+      # The slot must hold a real OpenSSL; a build that silently found none
+      # would pass a handshake-free run.
+      - name: Assert OpenSSL was found
+        run: |
+          grep NXT_HAVE_OPENSSL build/include/nxt_auto_config.h
+
+      - name: Build unitd and libunit
+        run: make -j4
+
+      - name: Configure and build the python module
+        run: |
+          prefix="$(python3 -c 'import sys; print(sys.base_prefix)')"
+          sudo ./configure python \
+            --config="${prefix}/bin/python3-config" \
+            --lib-path="${prefix}/lib"
+          sudo make python3
+
+      - name: Fix permissions
+        run: |
+          sudo chmod -R +x "$HOME"
+          namei -l "$PWD"
+
+      - name: Run the TLS tests
+        env:
+          TZ: Asia/Kolkata
+        run: |
+          sudo env TZ="${TZ:-}" pytest-3 --print-log --unsafe \
+            --port 18080 test/test_tls.py
+
+  # The build gate: TLS compiled out.  conn_init on the table must not create a
+  # dependency of the no-TLS build on the OpenSSL backend.
+  no-tls:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get -y -qq install libpcre2-dev zlib1g-dev
+
+      - name: Configure unit without OpenSSL
+        run: ./configure --tests
+
+      - name: Assert OpenSSL was NOT found
+        run: |
+          if grep -q 'NXT_HAVE_OPENSSL ' build/include/nxt_auto_config.h; then
+            echo '::error::the no-TLS build found OpenSSL' >&2
+            exit 1
+          fi
+
+      - name: Build unitd
+        run: make -j4
