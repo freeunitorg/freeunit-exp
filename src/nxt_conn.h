@@ -65,6 +65,15 @@ typedef struct {
      */
     ssize_t                       (*sendbuf)(nxt_task_t *task,
                                        nxt_sendbuf_t *sb);
+
+    /*
+     * The sendfile_ready() reports whether sendbuf() can take a file buffer
+     * for this connection, that is, whether a file can be sent without being
+     * read into memory first.  A TLS connection sets it while kernel TLS is
+     * active and sends the file with SSL_sendfile().  NULL means it cannot.
+     */
+    nxt_bool_t                    (*sendfile_ready)(nxt_conn_t *c);
+
     /*
      * The sendbuf() is an interface for OS-specific sendfile
      * implementations or simple writev().

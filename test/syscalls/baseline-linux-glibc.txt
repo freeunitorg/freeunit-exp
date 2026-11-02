@@ -37,7 +37,6 @@ getrandom
 getsockopt
 gettid
 ioctl
-kill
 listen
 lseek
 memfd_create
@@ -59,7 +58,9 @@ rseq
 rt_sigaction
 rt_sigprocmask
 sched_getaffinity
+sendfile
 sendmsg
+sendto
 set_robust_list
 set_tid_address
 setgid
